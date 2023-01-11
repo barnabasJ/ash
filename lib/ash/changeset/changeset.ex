@@ -338,7 +338,7 @@ defmodule Ash.Changeset do
 
   See those functions for more explanation.
   """
-  def for_action(initial, action, params \\ %{}, opts \\ []) do
+  def for_action(initial, action_name, params \\ %{}, opts \\ []) do
     resource =
       case initial do
         %__MODULE__{resource: resource} -> resource
@@ -346,17 +346,17 @@ defmodule Ash.Changeset do
         resource -> resource
       end
 
-    action = Ash.Resource.Info.action(resource, action)
+    action = Ash.Resource.Info.action(resource, action_name)
 
     case action.type do
       :create ->
-        for_create(initial, action, params, opts)
+        for_create(initial, action_name, params, opts)
 
       :update ->
-        for_update(initial, action, params, opts)
+        for_update(initial, action_name, params, opts)
 
       :destroy ->
-        for_destroy(initial, action, params, opts)
+        for_destroy(initial, action_name, params, opts)
 
       :read ->
         raise ArgumentError,

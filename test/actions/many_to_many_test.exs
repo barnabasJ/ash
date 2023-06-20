@@ -39,6 +39,38 @@ defmodule Ash.Test.Actions.ManyToManyTest do
     end
   end
 
+  defmodule SlugCalc do
+    use Ash.Calculation
+
+    @impl true
+    def select(_, _, _) do
+      [:title]
+    end
+
+    @impl true
+    def calculate(%{title: title}, _, _) do
+      IO.inspect("slug")
+
+      title
+      |> String.downcase()
+      |> String.replace(~r/\s+/, "-")
+    end
+  end
+
+  defmodule UrlCalc do
+    use Ash.Calculation
+
+    @impl true
+    def load(_, _, _) do
+      [:slug]
+    end
+
+    @impl true
+    def calculate(%{slug: slug}, _, _) do
+      "https://example.com/posts/#{slug}"
+    end
+  end
+
   defmodule Post do
     @moduledoc false
     use Ash.Resource,
@@ -63,6 +95,14 @@ defmodule Ash.Test.Actions.ManyToManyTest do
     attributes do
       uuid_primary_key :id
       attribute :title, :string
+    end
+
+    calculations do
+      calculate :slug, :string, SlugCalc
+
+      calculate :url,
+                :string,
+                UrlCalc
     end
 
     relationships do
@@ -106,6 +146,44 @@ defmodule Ash.Test.Actions.ManyToManyTest do
         linked_posts: [%{title: "foo"}, %{title: "bar"}]
       })
       |> Api.create!()
+    end
+
+    @tag :wip
+    test "it allows loading calculations on the related resources" do
+      import Ash.Query, only: [expr: 1]
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{
+          title: "buz",
+          linked_posts: [%{title: "foo"}, %{title: "bar"}]
+        })
+        |> Api.create!()
+
+      post_id = post.id
+
+      post =
+        Post
+        |> Ash.Query.for_read(:read)
+        |> Ash.Query.filter(expr(id == ^post_id))
+        |> Ash.Query.load(linked_posts: [:url])
+        |> Api.read_one!()
+        |> IO.inspect()
+
+      assert %Ash.Test.Actions.ManyToManyTest.Post{
+               title: "buz",
+               id: ^post_id,
+               linked_posts: [
+                 %Ash.Test.Actions.ManyToManyTest.Post{
+                   title: "bar",
+                   url: "https://example.com/posts/bar"
+                 },
+                 %Ash.Test.Actions.ManyToManyTest.Post{
+                   title: "foo",
+                   url: "https://example.com/posts/foo"
+                 }
+               ]
+             } = post
     end
   end
 end

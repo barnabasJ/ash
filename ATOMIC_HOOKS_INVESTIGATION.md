@@ -400,18 +400,57 @@ With clean resource (no identities):
 
 ---
 
-## CRITICAL BUG IDENTIFIED
+## RESOLUTION: NOT A BUG - CORRECT USAGE PATTERN IDENTIFIED
 
-**The `atomic_after_action` mechanism does not work for hooks added by action
-changes.**
+**Initial Assumption (INCORRECT):** The `atomic_after_action` mechanism was
+believed to be broken because hooks added in `change/3` were not executing
+during atomic operations.
 
-This means:
+**Actual Behavior (CORRECT):** For atomic execution, `after_action` hooks must
+be added in the `atomic/3` callback, not in `change/3`. This is the intended
+design.
 
-- Users define changes that add `after_action` hooks
-- Actions using those changes attempt atomic upgrade
-- Upgrade succeeds (dirty_hooks is empty)
-- **Hooks are silently dropped**
-- No error, no warning, hooks just don't run
+### Correct Usage Pattern
 
-This is a **silent data loss/corruption risk** if hooks perform critical
-operations!
+```elixir
+defmodule MyChange do
+  use Ash.Resource.Change
+
+  def change(changeset, _opts, _context) do
+    # For non-atomic execution
+    Ash.Changeset.after_action(changeset, fn _changeset, result, _context ->
+      # 3-arity signature for non-atomic
+      {:ok, result}
+    end)
+  end
+
+  def atomic(changeset, _opts, _context) do
+    # For atomic execution - add hook here
+    changeset =
+      Ash.Changeset.after_action(changeset, fn _changeset, result ->
+        # 2-arity signature for atomic (no context parameter)
+        {:ok, result}
+      end)
+
+    {:atomic, changeset, %{}}
+  end
+end
+```
+
+### Key Learnings
+
+1. **`after_action` hooks for atomic operations must be added in `atomic/3`**
+
+   - Return `{:atomic, changeset, %{}}` to include the modified changeset
+
+2. **Hook signatures differ between atomic and non-atomic:**
+
+   - Non-atomic: `fn changeset, result, context ->`
+   - Atomic: `fn changeset, result ->` (no context parameter)
+
+3. **The `atomic_after_action` list is for internal use:**
+   - Populated when hooks are added during `:pending` phase
+   - Not intended for hooks added by action changes during `:validate` phase
+   - Users should add hooks in `atomic/3` for atomic execution
+
+This is **not a bug** - it's the correct design pattern for atomic operations.

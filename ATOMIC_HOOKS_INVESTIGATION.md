@@ -391,10 +391,10 @@ With clean resource (no identities):
 
 ### 4. The REAL Behavior Summary
 
-| Hook Type                             | Added to dirty_hooks?      | Added to atomic_after_action? | Atomic Upgrade | Hook Executes? |
-| ------------------------------------- | -------------------------- | ----------------------------- | -------------- | -------------- |
-| after_action (via action change)      | ❌ No (phase is :validate) | ❌ No (phase is :validate)    | ✅ Succeeds    | ❌ **LOST**    |
-| after_transaction (via action change) | ❌ No (phase is :validate) | N/A                           | ✅ Succeeds\*  | ❌ **LOST**    |
+| Hook Type                             | Added to dirty_hooks?      | Added to atomic_after_action? | Atomic Upgrade | Hook Executes?                    | Notes                                  |
+| ------------------------------------- | -------------------------- | ----------------------------- | -------------- | --------------------------------- | -------------------------------------- |
+| after_action (via action change)      | ❌ No (phase is :validate) | ❌ No (phase is :validate)    | ✅ Succeeds    | ✅ **Works if added in atomic/3** | Must use 2-arity signature in atomic/3 |
+| after_transaction (via action change) | ❌ No (phase is :validate) | N/A                           | ❓ Unknown\*   | ❌ **Not supported in atomic**    | Investigation needed                   |
 
 \*Falls back for unknown reason despite passing dirty_hooks check
 
@@ -454,3 +454,81 @@ end
    - Users should add hooks in `atomic/3` for atomic execution
 
 This is **not a bug** - it's the correct design pattern for atomic operations.
+
+---
+
+## NEXT: after_transaction Support for Atomic Operations
+
+### Current Status
+
+The `after_transaction` hook behavior with atomic operations is **not yet fully
+understood**:
+
+1. **Known Facts:**
+
+   - `after_transaction` hooks are NOT added to `dirty_hooks` (phase is
+     `:validate`)
+   - They DO NOT prevent atomic upgrade via the explicit dirty_hooks check
+   - The atomic upgrade check passes (no errors about dirty_hooks)
+   - Yet atomic operations fall back to non-atomic for unknown reasons
+
+2. **Unknown:**
+
+   - **WHY does atomic fallback occur when `after_transaction` hooks are
+     present?**
+   - Which condition in the atomic upgrade pipeline causes this?
+   - Is this intentional behavior or a side effect?
+   - Can we make `after_transaction` work with atomic operations?
+
+3. **Goal:**
+   - Get `after_transaction` hooks working with atomic operations
+   - Understand the mechanism that causes fallback
+   - Implement support if it's missing
+   - Document the correct usage pattern
+
+### Investigation Tasks
+
+1. **Find the fallback trigger:**
+
+   - Review all conditions in `fully_atomic_changeset/4` that return
+     `{:not_atomic, reason}`
+   - Add instrumentation to identify which condition triggers with
+     `after_transaction`
+   - Check if transaction hooks have explicit blocking logic
+
+2. **Understand transaction hook lifecycle:**
+
+   - When should `after_transaction` run relative to atomic operations?
+   - Do atomic operations even have transactions?
+   - What's the semantic difference between atomic and transactional?
+
+3. **Research existing patterns:**
+
+   - Look at how batch operations handle transactions
+   - Check if `before_transaction`/`around_transaction` have similar issues
+   - See if there are any existing atomic transaction hooks
+
+4. **Design the solution:**
+   - Determine if hooks should be added in `atomic/3` callback (like
+     `after_action`)
+   - Or if they need a different mechanism (like batch transaction callbacks)
+   - Consider the `before_batch_transaction`/`after_batch_transaction` pattern
+
+### Files to Investigate
+
+- `/home/joba/sandbox/ash/lib/ash/changeset/changeset.ex` - Hook registration,
+  phase lifecycle
+- `/home/joba/sandbox/ash/lib/ash/actions/update/update.ex` - Atomic upgrade
+  logic
+- `/home/joba/sandbox/ash/lib/ash/actions/update/bulk.ex` - Bulk atomic
+  operations with transactions
+- `/home/joba/sandbox/ash/lib/ash/resource/change.ex` - Change behavior
+  definitions
+
+### Test Strategy
+
+Create tests to verify:
+
+1. Atomic operations with `after_transaction` hooks (currently fails/falls back)
+2. Correct way to add transaction hooks in atomic context
+3. Hook execution order: atomic operation → transaction → after_transaction hook

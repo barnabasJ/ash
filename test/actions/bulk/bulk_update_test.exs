@@ -118,6 +118,25 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     end
   end
 
+  defmodule AddAfterActionHook do
+    @moduledoc """
+    This change adds an after_action hook and supports atomic execution.
+    Used to demonstrate that hooks added by changes are silently lost during atomic upgrades.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_action(changeset, fn _changeset, result, _context ->
+        send(self(), {:after_action_hook_executed, result.id})
+        {:ok, result}
+      end)
+    end
+
+    def atomic(_changeset, _opts, _context) do
+      {:atomic, %{}}
+    end
+  end
+
   defmodule Address do
     @moduledoc false
     use Ash.Resource, domain: Domain, data_layer: :embedded
@@ -1748,6 +1767,77 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       assert is_list(notifications)
       refute Enum.empty?(notifications)
+    end
+  end
+
+  describe "atomic upgrade hooks bug" do
+    # Bug demonstration: after_action hooks are silently lost during atomic execution
+    # See: https://github.com/ash-project/ash/issues/XXXX
+
+    defmodule SimplePost do
+      @moduledoc """
+      A minimal resource with NO identities, NO validations, NO relationships.
+      Used to test pure hook behavior without interference.
+      """
+      use Ash.Resource,
+        domain: Domain,
+        data_layer: Ash.DataLayer.Ets
+
+      ets do
+        private? true
+      end
+
+      attributes do
+        uuid_primary_key :id
+
+        attribute :title, :string do
+          public? true
+        end
+
+        attribute :body, :string do
+          public? true
+        end
+      end
+
+      actions do
+        default_accept :*
+        defaults [:read, :destroy, create: :*, update: :*]
+
+        update :update_with_after_action do
+          change AddAfterActionHook
+        end
+      end
+    end
+
+    test "BUG: after_action hooks are silently lost during atomic upgrade" do
+      # This test demonstrates a critical bug where after_action hooks added by
+      # action changes are silently dropped during atomic execution.
+      #
+      # ROOT CAUSE:
+      # 1. Action changes run during :validate phase (not :pending)
+      # 2. Hooks are only added to atomic_after_action during :pending phase
+      # 3. During atomic upgrade, only atomic_after_action hooks are transferred
+      # 4. Result: Hook is silently lost with no error or warning
+      #
+      # EXPECTED: Hook executes after atomic operation completes
+      # ACTUAL: Hook is silently dropped, never executes
+
+      simple_post =
+        SimplePost
+        |> Ash.Changeset.for_create(:create, %{title: "test", body: "body"})
+        |> Ash.create!()
+
+      result =
+        simple_post
+        |> Ash.Changeset.for_update(:update_with_after_action, %{body: "updated"})
+        |> Ash.update!()
+
+      # Update succeeds
+      assert result.body == "updated"
+
+      # BUG: This assertion SHOULD pass but FAILS because the hook is lost
+      # The hook added in AddAfterActionHook.change/3 never executes
+      assert_receive {:after_action_hook_executed, _}, 500
     end
   end
 end

@@ -775,4 +775,309 @@ defmodule Ash.Actions.MultitenancyTest do
       assert converted_tenant == tenant
     end
   end
+
+  describe "relationships between tenanted and non-tenanted resources" do
+    setup do
+      %{tenant1: Ash.UUID.generate(), tenant2: Ash.UUID.generate()}
+    end
+
+    # Loading from tenanted to non-tenanted
+
+    @tag :relationships_cross_tenancy
+    test "loads non-tenanted posts from tenanted user", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "Test User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Test Post", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      user_with_posts = Ash.load!(user, :posts)
+      assert [loaded_post] = user_with_posts.posts
+      assert loaded_post.id == post.id
+    end
+
+    @tag :relationships_cross_tenancy
+    test "loads multiple non-tenanted posts from tenanted user", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "Test User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Post 1", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Post 2", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      user_with_posts = Ash.load!(user, :posts)
+      assert length(user_with_posts.posts) == 2
+      post_ids = Enum.map(user_with_posts.posts, & &1.id)
+      assert post1.id in post_ids
+      assert post2.id in post_ids
+    end
+
+    # Loading from non-tenanted to tenanted
+
+    @tag :relationships_cross_tenancy
+    test "loads tenanted author from post with explicit tenant context", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "Author"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Test Post", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      post_with_author = Ash.load!(post, :author, tenant: tenant1)
+      assert post_with_author.author.id == user.id
+      assert post_with_author.author.name == "Author"
+    end
+
+    @tag :relationships_cross_tenancy
+    test "loads tenanted likes from post with explicit tenant context", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Test Post", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      like =
+        Like
+        |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      post_with_likes = Ash.load!(post, :likes, tenant: tenant1)
+      assert [loaded_like] = post_with_likes.likes
+      assert loaded_like.id == like.id
+    end
+
+    @tag :relationships_cross_tenancy
+    test "loads tenanted likes through relationship without explicit tenant context", %{
+      tenant1: tenant1
+    } do
+      # Note: When loading through a relationship from a non-tenanted resource,
+      # Ash doesn't require tenant to be specified - it loads based on the
+      # relationship's foreign key filtering, not multitenancy filtering.
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Test Post", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      like =
+        Like
+        |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      # Loading through relationship works without explicit tenant
+      # because the relationship filter (post_id) is applied
+      post_loaded = Ash.load!(post, :likes)
+      assert [loaded_like] = post_loaded.likes
+      assert loaded_like.id == like.id
+    end
+
+    @tag :relationships_cross_tenancy
+    test "only loads likes from specified tenant", %{tenant1: tenant1, tenant2: tenant2} do
+      user1 =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "User 1"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Shared Post", author_id: user1.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      like1 =
+        Like
+        |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      _like2 =
+        Like
+        |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant2)
+        |> Ash.create!()
+
+      post_with_likes = Ash.load!(post, :likes, tenant: tenant1)
+      assert length(post_with_likes.likes) == 1
+      assert hd(post_with_likes.likes).id == like1.id
+    end
+
+    # Creating with cross-tenancy foreign keys
+
+    @tag :relationships_cross_tenancy
+    test "creates non-tenanted post referencing tenanted user", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "Author"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "New Post", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      assert post.author_id == user.id
+      assert post.name == "New Post"
+    end
+
+    @tag :relationships_cross_tenancy
+    test "creates tenanted like referencing non-tenanted post", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Post", author_id: user.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      like =
+        Like
+        |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      assert like.post_id == post.id
+      assert like.org_id == tenant1
+    end
+
+    @tag :relationships_cross_tenancy
+    test "requires tenant when creating tenanted like even with non-tenanted post FK", %{
+      tenant1: tenant1
+    } do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Post", author_id: user.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      assert_raise Ash.Error.Invalid, ~r/tenant.*required/i, fn ->
+        Like
+        |> Ash.Changeset.for_create(:create, %{post_id: post.id})
+        |> Ash.create!()
+      end
+    end
+
+    # Aggregates across tenancy boundaries
+
+    @tag :relationships_cross_tenancy
+    test "counts tenanted likes on non-tenanted post with tenant context", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Post", author_id: user.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      Like
+      |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant1)
+      |> Ash.create!()
+
+      Like
+      |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant1)
+      |> Ash.create!()
+
+      count = Ash.count!(Like, tenant: tenant1, query: [filter: [post_id: post.id]])
+      assert count == 2
+    end
+
+    @tag :relationships_cross_tenancy
+    test "aggregate respects tenant isolation", %{tenant1: tenant1, tenant2: tenant2} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "User"}, tenant: tenant1)
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Post", author_id: user.id}, tenant: tenant1)
+        |> Ash.create!()
+
+      Like
+      |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant1)
+      |> Ash.create!()
+
+      Like
+      |> Ash.Changeset.for_create(:create, %{post_id: post.id}, tenant: tenant2)
+      |> Ash.create!()
+
+      count_tenant1 = Ash.count!(Like, tenant: tenant1, query: [filter: [post_id: post.id]])
+      count_tenant2 = Ash.count!(Like, tenant: tenant2, query: [filter: [post_id: post.id]])
+
+      assert count_tenant1 == 1
+      assert count_tenant2 == 1
+    end
+
+    # Filtering across tenancy boundaries
+
+    @tag :relationships_cross_tenancy
+    test "filters non-tenanted posts by tenanted author", %{tenant1: tenant1} do
+      user =
+        User
+        |> Ash.Changeset.for_create(:create, %{name: "Target Author"}, tenant: tenant1)
+        |> Ash.create!()
+
+      matching_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Author's Post", author_id: user.id},
+          tenant: tenant1
+        )
+        |> Ash.create!()
+
+      _other_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{name: "Other Post"}, tenant: tenant1)
+        |> Ash.create!()
+
+      results =
+        Post
+        |> Ash.Query.filter(author_id == ^user.id)
+        |> Ash.read!(tenant: tenant1)
+
+      assert length(results) == 1
+      assert hd(results).id == matching_post.id
+    end
+  end
 end

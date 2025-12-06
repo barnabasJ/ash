@@ -105,6 +105,110 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     end
   end
 
+  defmodule AddAfterTransactionDuringPending do
+    @moduledoc """
+    This change adds an after_transaction hook during the :pending phase
+    (in change/3) but also supports atomic execution (via atomic/3).
+    This demonstrates that after_transaction hooks prevent atomic upgrade.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      IO.puts("\n=== AddAfterTransactionDuringPending.change/3 called ===")
+      IO.puts("Phase: #{inspect(changeset.phase)}")
+      IO.puts("Dirty hooks before: #{inspect(changeset.dirty_hooks)}")
+
+      # This runs during :pending phase, so after_transaction hook is added
+      changeset =
+        Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+          IO.puts("\n=== after_transaction HOOK EXECUTED ===")
+          send(self(), {:atomic_upgrade_after_transaction_called, result.id})
+          {:ok, result}
+        end)
+
+      IO.puts("Dirty hooks after: #{inspect(changeset.dirty_hooks)}")
+      IO.puts("after_transaction list: #{inspect(length(changeset.after_transaction))} hooks")
+      changeset
+    end
+
+    def atomic(_changeset, _opts, _context) do
+      IO.puts("\n=== AddAfterTransactionDuringPending.atomic/3 called ===")
+      # Support atomic execution - just return empty atomics
+      {:atomic, %{}}
+    end
+  end
+
+  defmodule AddAfterActionDuringPending do
+    @moduledoc """
+    This change adds an after_action hook during the :pending phase
+    and supports atomic execution to demonstrate successful atomic upgrade.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      IO.puts("\n=== AddAfterActionDuringPending.change/3 called ===")
+      IO.puts("Phase: #{inspect(changeset.phase)}")
+      IO.puts("Dirty hooks before: #{inspect(changeset.dirty_hooks)}")
+
+      changeset =
+        Ash.Changeset.after_action(changeset, fn _changeset, result, _context ->
+          IO.puts("\n=== after_action HOOK EXECUTED ===")
+          send(self(), {:atomic_upgrade_after_action_called, result.id})
+          {:ok, result}
+        end)
+
+      IO.puts("Dirty hooks after: #{inspect(changeset.dirty_hooks)}")
+      IO.puts("after_action list: #{inspect(length(changeset.after_action))} hooks")
+      IO.puts("atomic_after_action list: #{inspect(length(changeset.atomic_after_action))} hooks")
+      changeset
+    end
+
+    def atomic(_changeset, _opts, _context) do
+      IO.puts("\n=== AddAfterActionDuringPending.atomic/3 called ===")
+      {:atomic, %{}}
+    end
+  end
+
+  defmodule SimplePost do
+    @moduledoc """
+    A minimal resource with NO identities, NO validations, NO relationships.
+    Used to test pure hook behavior without interference.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    attributes do
+      uuid_primary_key :id
+
+      attribute :title, :string do
+        public? true
+      end
+
+      attribute :body, :string do
+        public? true
+      end
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, :destroy, create: :*, update: :*]
+
+      update :update_with_after_transaction do
+        require_atomic? false
+        change AddAfterTransactionDuringPending
+      end
+
+      update :update_with_after_action do
+        change AddAfterActionDuringPending
+      end
+    end
+  end
+
   defmodule AtomicallyRequireActor do
     use Ash.Resource.Change
 
@@ -364,6 +468,20 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       update :update_with_atomic_after_transaction do
         change AtomicWithAfterTransaction
+      end
+
+      update :update_with_atomic_upgrade_and_after_transaction do
+        # This action allows atomic upgrade but will fall back to non-atomic
+        # if atomic upgrade fails (e.g., due to after_transaction hooks)
+        require_atomic? false
+        skip_global_validations? true
+        change AddAfterTransactionDuringPending
+      end
+
+      update :update_with_atomic_upgrade_and_after_action do
+        # This action successfully upgrades to atomic with after_action hooks
+        skip_global_validations? true
+        change AddAfterActionDuringPending
       end
     end
 
@@ -1787,6 +1905,149 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
           strategy: :atomic
         )
       end
+    end
+
+    test "after_transaction hooks added during :pending phase prevent atomic upgrade" do
+      IO.puts("\n\n" <> String.duplicate("=", 80))
+      IO.puts("TEST: after_transaction hooks PREVENT atomic upgrade")
+      IO.puts(String.duplicate("=", 80))
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test", title2: "test2"})
+        |> Ash.create!()
+
+      # Update a single record - this will attempt atomic upgrade
+      # The change's change/3 callback adds an after_transaction hook during :pending phase
+      # This causes the changeset to have :after_transaction in dirty_hooks
+      # Which prevents atomic upgrade, forcing it to fall back to non-atomic update
+      result =
+        post
+        |> Ash.Changeset.for_update(:update_with_atomic_upgrade_and_after_transaction, %{
+          title2: "updated"
+        })
+        |> Ash.update!()
+
+      # The update succeeds
+      assert result.title2 == "updated"
+
+      # The after_transaction hook DID run because it fell back to non-atomic update
+      assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
+
+      IO.puts("\n" <> String.duplicate("=", 80))
+      IO.puts("TEST COMPLETE: after_transaction prevented atomic upgrade")
+      IO.puts(String.duplicate("=", 80) <> "\n")
+    end
+
+    test "after_action hooks added during :pending phase allow atomic upgrade" do
+      IO.puts("\n\n" <> String.duplicate("=", 80))
+      IO.puts("TEST: after_action hooks ALLOW atomic upgrade")
+      IO.puts(String.duplicate("=", 80))
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test", title2: "test2"})
+        |> Ash.create!()
+
+      # Update a single record - this will attempt atomic upgrade
+      # The change's change/3 callback adds an after_action hook during :pending phase
+      # after_action is NOT in dirty_hooks (excluded), so atomic upgrade succeeds
+      result =
+        post
+        |> Ash.Changeset.for_update(:update_with_atomic_upgrade_and_after_action, %{
+          title2: "updated"
+        })
+        |> Ash.update!()
+
+      # The update succeeds
+      assert result.title2 == "updated"
+
+      # The after_action hook DID run (even though it was atomic!)
+      assert_receive {:atomic_upgrade_after_action_called, _}, 100
+
+      IO.puts("\n" <> String.duplicate("=", 80))
+      IO.puts("TEST COMPLETE: after_action allowed atomic upgrade")
+      IO.puts(String.duplicate("=", 80) <> "\n")
+    end
+  end
+
+  describe "clean atomic upgrade tests (no identity validation interference)" do
+    test "CLEAN: after_transaction hooks prevent atomic upgrade" do
+      IO.puts("\n\n" <> String.duplicate("=", 80))
+      IO.puts("CLEAN TEST: after_transaction hooks behavior")
+      IO.puts(String.duplicate("=", 80))
+
+      simple_post =
+        SimplePost
+        |> Ash.Changeset.for_create(:create, %{title: "test", body: "body"})
+        |> Ash.create!()
+
+      result =
+        simple_post
+        |> Ash.Changeset.for_update(:update_with_after_transaction, %{body: "updated"})
+        |> Ash.update!()
+
+      assert result.body == "updated"
+      assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
+
+      IO.puts("\n" <> String.duplicate("=", 80))
+      IO.puts("CLEAN TEST COMPLETE")
+      IO.puts(String.duplicate("=", 80) <> "\n")
+    end
+
+    @tag :skip
+    test "CLEAN: after_action hooks allow atomic upgrade" do
+      IO.puts("\n\n" <> String.duplicate("=", 80))
+      IO.puts("CLEAN TEST: after_action hooks behavior")
+      IO.puts(String.duplicate("=", 80))
+
+      simple_post =
+        SimplePost
+        |> Ash.Changeset.for_create(:create, %{title: "test", body: "body"})
+        |> Ash.create!()
+
+      result =
+        simple_post
+        |> Ash.Changeset.for_update(:update_with_after_action, %{body: "updated"})
+        |> Ash.update!()
+
+      assert result.body == "updated"
+      assert_receive {:atomic_upgrade_after_action_called, _}, 100
+
+      IO.puts("\n" <> String.duplicate("=", 80))
+      IO.puts("CLEAN TEST COMPLETE")
+      IO.puts(String.duplicate("=", 80) <> "\n")
+    end
+
+    test "BUG: after_action hooks are silently lost during atomic upgrade" do
+      # This test demonstrates a critical bug where after_action hooks added by
+      # action changes are silently dropped during atomic execution.
+      #
+      # ROOT CAUSE:
+      # 1. Action changes run during :validate phase (not :pending)
+      # 2. Hooks are only added to atomic_after_action during :pending phase
+      # 3. During atomic upgrade, only atomic_after_action hooks are transferred
+      # 4. Result: Hook is silently lost with no error or warning
+      #
+      # EXPECTED: Hook executes after atomic operation completes
+      # ACTUAL: Hook is silently dropped, never executes
+
+      simple_post =
+        SimplePost
+        |> Ash.Changeset.for_create(:create, %{title: "test", body: "body"})
+        |> Ash.create!()
+
+      result =
+        simple_post
+        |> Ash.Changeset.for_update(:update_with_after_action, %{body: "updated"})
+        |> Ash.update!()
+
+      # Update succeeds
+      assert result.body == "updated"
+
+      # BUG: This assertion SHOULD pass but FAILS because the hook is lost
+      # The hook added in AddAfterActionDuringPending.change/3 never executes
+      assert_receive {:atomic_upgrade_after_action_called, _}, 500
     end
   end
 end

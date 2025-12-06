@@ -55,6 +55,14 @@ defmodule Ash.Actions.Update do
 
       dirty_hooks = changeset.dirty_hooks -- [:after_action]
 
+      IO.puts("\n=== ATOMIC UPGRADE CHECK ===")
+      IO.puts("Action: #{changeset.action.name}")
+      IO.puts("All dirty_hooks: #{inspect(changeset.dirty_hooks)}")
+      IO.puts("dirty_hooks (excluding after_action): #{inspect(dirty_hooks)}")
+      IO.puts("after_action hooks: #{inspect(length(changeset.after_action))}")
+      IO.puts("atomic_after_action hooks: #{inspect(length(changeset.atomic_after_action))}")
+      IO.puts("after_transaction hooks: #{inspect(length(changeset.after_transaction))}")
+
       {fully_atomic_changeset, params} =
         cond do
           !action.require_atomic? && !action.atomic_upgrade? ->

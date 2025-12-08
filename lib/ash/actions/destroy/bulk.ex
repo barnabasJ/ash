@@ -310,6 +310,33 @@ defmodule Ash.Actions.Destroy.Bulk do
           end
           |> case do
             {:ok, bulk_result} ->
+              bulk_result =
+                if Enum.empty?(atomic_changeset.after_transaction) do
+                  bulk_result
+                else
+                  {processed_records, errors} =
+                    Enum.reduce(
+                      bulk_result.records,
+                      {[], []},
+                      fn result, {records, errors} ->
+                        case Ash.Changeset.run_after_transactions({:ok, result}, atomic_changeset) do
+                          {:ok, result} ->
+                            {[result | records], errors}
+
+                          {:error, error} ->
+                            {records, [error | errors]}
+                        end
+                      end
+                    )
+
+                  %{
+                    bulk_result
+                    | records: Enum.reverse(processed_records),
+                      errors: bulk_result.errors ++ Enum.reverse(errors),
+                      error_count: bulk_result.error_count + length(errors)
+                  }
+                end
+
               if opts[:return_notifications?] do
                 bulk_result
               else
@@ -562,7 +589,8 @@ defmodule Ash.Actions.Destroy.Bulk do
       |> Map.put(
         :return_records?,
         has_after_batch_hooks? || opts[:notify?] || opts[:return_records?] ||
-          !Enum.empty?(atomic_changeset.after_action)
+          !Enum.empty?(atomic_changeset.after_action) ||
+          !Enum.empty?(atomic_changeset.after_transaction)
       )
       |> Map.put(:calculations, calculations)
       |> Map.put(

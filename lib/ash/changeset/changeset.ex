@@ -90,6 +90,7 @@ defmodule Ash.Changeset do
     params: %{},
     action_select: [],
     atomic_after_action: [],
+    atomic_after_transaction: [],
     attribute_changes: %{},
     atomic_changes: [],
     casted_attributes: %{},
@@ -6709,6 +6710,12 @@ defmodule Ash.Changeset do
 
   Provide the option `prepend?: true` to place the hook before all other hooks instead of after.
 
+  ## Atomic Operations
+
+  This hook works with atomic bulk operations. When implementing a change that supports both
+  stream and atomic strategies, add the hook in both the `change/3` and `atomic/3` callbacks.
+  See the `Ash.Resource.Change` documentation for examples of atomic-compatible changes.
+
   ## Examples
 
       # Create related audit record with the final data
@@ -6801,6 +6808,12 @@ defmodule Ash.Changeset do
 
   Provide the option `prepend?: true` to place the hook before all other hooks instead of after.
 
+  ## Atomic Operations
+
+  This hook works with atomic bulk operations. When implementing a change that supports both
+  stream and atomic strategies, add the hook in both the `change/3` and `atomic/3` callbacks.
+  See the `Ash.Resource.Change` documentation for examples of atomic-compatible changes.
+
   ## Examples
 
       # Send notification regardless of order creation success/failure
@@ -6863,17 +6876,26 @@ defmodule Ash.Changeset do
   def after_transaction(changeset, func, opts \\ []) do
     changeset = maybe_dirty_hook(changeset, :after_transaction)
 
-    if changeset.phase in [:pending, :validate] do
-      if opts[:prepend?] do
+    if opts[:prepend?] do
+      if changeset.phase == :pending do
+        %{
+          changeset
+          | after_transaction: [func | changeset.after_transaction],
+            atomic_after_transaction: [func | changeset.atomic_after_transaction]
+        }
+      else
         %{changeset | after_transaction: [func | changeset.after_transaction]}
+      end
+    else
+      if changeset.phase == :pending do
+        %{
+          changeset
+          | after_transaction: changeset.after_transaction ++ [func],
+            atomic_after_transaction: changeset.atomic_after_transaction ++ [func]
+        }
       else
         %{changeset | after_transaction: changeset.after_transaction ++ [func]}
       end
-    else
-      Ash.Changeset.add_error(
-        changeset,
-        "Cannot add after_transaction hooks inside of other hooks, or in atomic hooks. Current phase: #{inspect(changeset.phase)}."
-      )
     end
   end
 

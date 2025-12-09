@@ -1,534 +1,111 @@
-# Investigation: after_action vs after_transaction with Atomic Updates
-
-## Date: 2025-12-06
+# Investigation: after_transaction Hooks Not Working with atomic_batches Strategy
 
 ## Summary
 
-This document captures the empirical findings from instrumented test runs
-showing exactly how `after_action` and `after_transaction` hooks behave during
-atomic upgrade attempts.
+When passing a **list of records** (not a query) to `bulk_destroy` with `atomic_batches` strategy, `after_transaction` hooks don't execute automatically without explicit `return_records?: true`. This is because an optimization (`select([])`) prevents records from being loaded even though hooks need them.
 
----
+## Background
 
-## Test Setup
+- **Branch**: `atomic-after-transaction`
+- **Latest commit**: `feat: enable after_transaction hooks in atomic bulk operations`
+- The commit added support for `after_transaction` hooks in atomic bulk UPDATE and DESTROY operations
+- Tests were added but they ALL explicitly set `return_records?: true`
+- **Missing test coverage**: List-based atomic_batches with hooks relying on automatic `return_records?` calculation
 
-Created two change modules with IO.inspect instrumentation:
+## The Problem
 
-- `AddAfterActionDuringPending` - Adds `after_action` hook
-- `AddAfterTransactionDuringPending` - Adds `after_transaction` hook
+### Code Flow
 
-Both changes:
+1. When you pass a list of records like `[post1, post2, post3]` with `strategy: [:atomic_batches]`
+2. Goes through `do_atomic_batches` in `lib/ash/actions/destroy/bulk.ex:1034`
+3. For each batch, creates a query by primary keys (line 1047-1064)
+4. **Line 1064**: Applies `Ash.Query.select([])` - **THIS IS THE BUG**
+5. Even though `return_records?: true` is calculated based on hooks (line 593-596)
+6. The empty select prevents fields from being loaded
+7. Data layer returns 0 records or records with no fields
+8. Hooks can't execute because there are no records
 
-- Implement `change/3` callback (called during changeset processing)
-- Implement `atomic/3` callback (to support atomic execution)
-- Add hooks during their `change/3` execution
+### Key Code Locations
 
----
-
-## Actual Execution Flow
-
-### Test 1: after_transaction Hook
-
-**Action**: `update_with_atomic_upgrade_and_after_transaction`
-
-- `require_atomic? false` (allows fallback to non-atomic)
-- `skip_global_validations? true`
-
-**Execution Log**:
-
-```
-=== AddAfterTransactionDuringPending.change/3 called ===
-Phase: :validate
-Dirty hooks before: []
-Dirty hooks after: []
-after_transaction list: 1 hooks
-
-=== ATOMIC UPGRADE CHECK ===
-Action: update_with_atomic_upgrade_and_after_transaction
-All dirty_hooks: [:before_action]
-dirty_hooks (excluding after_action): [:before_action]
-after_action hooks: 0
-atomic_after_action hooks: 0
-after_transaction hooks: 1
-
-=== after_transaction HOOK EXECUTED ===
-```
-
-**Key Observations**:
-
-1. ✅ `change/3` runs in **`:validate` phase**, NOT `:pending`
-2. ✅ `after_transaction` hook IS added to changeset (1 hook present)
-3. ❌ Hook is NOT added to `dirty_hooks` (still `[]` after adding hook)
-4. ❌ `dirty_hooks` contains `[:before_action]` from identity validation
-5. ✅ Atomic upgrade FAILS due to `before_action` in dirty_hooks
-6. ✅ Falls back to non-atomic execution (because `require_atomic? false`)
-7. ✅ `after_transaction` hook EXECUTES successfully
-
----
-
-### Test 2: after_action Hook
-
-**Action**: `update_with_atomic_upgrade_and_after_action`
-
-- `require_atomic?` defaults to true
-- `skip_global_validations? true`
-
-**Execution Log**:
-
-```
-=== AddAfterActionDuringPending.change/3 called ===
-Phase: :validate
-Dirty hooks before: []
-Dirty hooks after: []
-after_action list: 1 hooks
-atomic_after_action list: 0 hooks
-
-=== ATOMIC UPGRADE CHECK ===
-Action: update_with_atomic_upgrade_and_after_action
-All dirty_hooks: [:before_action]
-dirty_hooks (excluding after_action): [:before_action]
-after_action hooks: 1
-atomic_after_action hooks: 0
-after_transaction hooks: 0
-
-ERROR: must be performed atomically, but it could not be
-Reason: cannot atomically run a changeset with hooks in any phase other than
-        `after_action`, got hooks in phases [:before_action]
-```
-
-**Key Observations**:
-
-1. ✅ `change/3` runs in **`:validate` phase**, NOT `:pending`
-2. ✅ `after_action` hook IS added to changeset (1 hook present)
-3. ❌ Hook is NOT added to `atomic_after_action` (still 0!)
-4. ❌ Hook is NOT added to `dirty_hooks` (still `[]` after adding hook)
-5. ❌ `dirty_hooks` contains `[:before_action]` from identity validation
-6. ✅ Atomic upgrade FAILS due to `before_action` in dirty_hooks
-7. ❌ Raises `MustBeAtomic` error (because `require_atomic?` is true)
-
----
-
-## Critical Finding: atomic_after_action Mechanism Doesn't Work As Expected
-
-### Expected Behavior (from code reading):
-
+**Hook calculation (WORKS):**
 ```elixir
-# In Ash.Changeset.after_action/3 (lines 6762, 6772)
-if changeset.phase == :pending do
-  %{
-    changeset
-    | after_action: changeset.after_action ++ [func],
-      atomic_after_action: changeset.atomic_after_action ++ [func]  # ← Dual storage
-  }
-else
-  %{changeset | after_action: changeset.after_action ++ [func]}
-end
+# lib/ash/actions/destroy/bulk.ex:593-596
+return_records? =
+  has_after_batch_hooks? || opts[:notify?] || opts[:return_records?] ||
+    !Enum.empty?(atomic_changeset.after_action) ||
+    !Enum.empty?(atomic_changeset.after_transaction)
 ```
 
-### Actual Behavior:
-
-- Changes run during **`:validate` phase** (not `:pending`)
-- Therefore hooks are ONLY added to `after_action`, NOT `atomic_after_action`
-- The `atomic_after_action` list remains empty!
-
-### When Does Phase Change to :validate?
-
+**The bug (empty select):**
 ```elixir
-# In changeset.ex:3125
-defp run_action_changes(changeset, %{changes: changes}, actor, authorize?, tracer, metadata) do
-  changeset = set_phase(changeset, :validate)  # ← Phase set HERE
-  # Changes run after this point
-end
+# lib/ash/actions/destroy/bulk.ex:1064
+|> Ash.Query.select([])  # <-- Blocks records from being loaded!
 ```
 
----
-
-## Why dirty_hooks Remains Empty
-
-### The maybe_dirty_hook Function:
-
+**Hook execution (FAILS):**
 ```elixir
-# In changeset.ex:6985-6991
-defp maybe_dirty_hook(changeset, type) do
-  if changeset.phase == :pending do  # ← Only adds during :pending!
-    %{changeset | dirty_hooks: Enum.uniq([type | changeset.dirty_hooks])}
+# lib/ash/actions/destroy/bulk.ex:314-352
+# Tries to execute hooks on bulk_result.records, but it's empty!
+```
+
+## Why Existing Tests Didn't Catch This
+
+All existing ash tests either:
+1. Use **queries** (not lists) - these go through `do_atomic_query`, not `do_atomic_batches`
+2. **Explicitly set `return_records?: true`** - bypasses the automatic calculation
+3. Don't test hooks with atomic_batches strategy
+
+## Differences: after_action vs after_transaction
+
+- **after_action hooks**: Execute INSIDE `do_atomic_query` (lines 683-709) on raw data layer results
+  - Can work even with empty select because they run earlier
+  
+- **after_transaction hooks**: Execute OUTSIDE `do_atomic_query` (lines 314-352) on `bulk_result.records`
+  - Fail because bulk_result.records is empty due to `select([])`
+
+## Tests Added
+
+### Test 1: after_transaction with atomic_batches (FAILS ❌)
+**Location**: `test/actions/bulk/bulk_destroy_test.exs:1101`
+
+### Test 2: after_action with atomic_batches (PASSES ✅)
+**Location**: `test/actions/bulk/bulk_destroy_test.exs:1135`
+
+## The Fix
+
+**Location**: `lib/ash/actions/destroy/bulk.ex:1064`
+
+Replace:
+```elixir
+|> Ash.Query.select([])
+```
+
+With:
+```elixir
+|> then(fn query ->
+  # Only use empty select if we don't need records for hooks
+  if Enum.empty?(atomic_changeset.after_transaction) &&
+       Enum.empty?(atomic_changeset.after_action) do
+    Ash.Query.select(query, [])
   else
-    changeset
+    query
   end
-end
+end)
 ```
 
-### Result:
+## Current State
 
-- `after_transaction` hook is added during `:validate` phase
-- `maybe_dirty_hook` does NOT add `:after_transaction` to `dirty_hooks`
-- `dirty_hooks` remains `[]` for our hooks
-
----
-
-## Why [:before_action] Appears in dirty_hooks
-
-Despite `skip_global_validations? true`, there's still a `[:before_action]` hook
-in dirty_hooks.
-
-### Source: Identity Validation
-
-```elixir
-# In changeset.ex:2790
-if identity.pre_check_with do
-  before_action(changeset, &validate_identity(&1, identity, identity.pre_check_with))
-end
-```
-
-The `unique_title` identity on the Post resource adds a `before_action` hook to
-pre-check uniqueness. This happens BEFORE the phase is set to `:validate`, so it
-DOES get added to `dirty_hooks`.
-
----
-
-## The Real Reason Atomic Upgrade Fails
-
-### For after_transaction Test:
-
-- ❌ Fails due to `[:before_action]` in dirty_hooks (from identity validation)
-- ✅ Falls back to non-atomic (because `require_atomic? false`)
-- ✅ `after_transaction` hook executes successfully in non-atomic path
-
-### For after_action Test:
-
-- ❌ Fails due to `[:before_action]` in dirty_hooks (from identity validation)
-- ❌ Raises error (because `require_atomic?` is true)
-- ❌ Never gets to execute atomically
-
-**Neither test demonstrates the behavior we intended to test!**
-
----
-
-## What This Means
-
-### Misconception #1: "after_action allows atomic upgrade"
-
-**Reality**: `after_action` is excluded from the dirty_hooks check:
-
-```elixir
-dirty_hooks = changeset.dirty_hooks -- [:after_action]  # Line 56
-```
-
-But our test shows `atomic_after_action` is empty, so the dual-storage mechanism
-isn't working during `for_update`.
-
-### Misconception #2: "after_transaction prevents atomic upgrade"
-
-**Reality**: `after_transaction` is NOT being added to dirty_hooks (phase is
-`:validate`, not `:pending`), so it's NOT preventing atomic upgrade. The
-`:before_action` hook from identity validation is what's preventing it.
-
-### Misconception #3: "atomic_after_action hooks are transferred during upgrade"
-
-**Reality**: They WOULD be transferred (update.ex:113-119), but the list is
-EMPTY because hooks are added during `:validate` phase, not `:pending`.
-
----
-
-## Questions Raised
-
-1. **When DOES `atomic_after_action` get populated?**
-
-   - Not during `for_update` processing (phase is `:validate`)
-   - Must be some other path where phase is `:pending` when hooks are added
-
-2. **How do atomic updates with `after_action` hooks actually work?**
-
-   - Current tests don't demonstrate this because of identity validation
-     interference
-
-3. **Is the `atomic_after_action` mechanism actually used?**
-   - Code exists to transfer them (update.ex:113-119)
-   - But when are they populated?
-
----
+- Tests added but NOT YET PASSING
+- Fix identified but NOT YET APPLIED
+- Debug output still in place
+- Same issue exists in bulk UPDATE at `lib/ash/actions/update/bulk.ex:1349`
 
 ## Next Steps
 
-1. Find or create a resource WITHOUT identity validations
-2. Test atomic upgrade with clean changeset
-3. Investigate when/how `atomic_after_action` gets populated in real usage
-4. Determine if the mechanism works for direct
-   `Ash.Changeset.new() |> after_action(...) |> for_update(...)`
+1. Apply the fix at `lib/ash/actions/destroy/bulk.ex:1064`
+2. Verify both tests pass
+3. Apply same fix to bulk UPDATE
+4. Remove debug output
+5. Run full test suite
+6. Commit changes
 
----
-
-## CLEAN TEST RESULTS (No Identity Validation)
-
-Created `SimplePost` resource with NO identities, validations, or relationships.
-
-### Test 1: after_transaction Hook
-
-**Execution Log**:
-
-```
-=== AddAfterTransactionDuringPending.change/3 called ===
-Phase: :validate
-Dirty hooks before: []
-Dirty hooks after: []
-after_transaction list: 1 hooks
-
-=== ATOMIC UPGRADE CHECK ===
-Action: update_with_after_transaction
-All dirty_hooks: []                    ← CLEAN!
-dirty_hooks (excluding after_action): []
-after_action hooks: 0
-atomic_after_action hooks: 0
-after_transaction hooks: 1
-
-=== after_transaction HOOK EXECUTED ===
-```
-
-**Result**: ✅ Test PASSED
-
-**Analysis**:
-
-- dirty_hooks is completely empty (no identity validation interference)
-- after_transaction hook is NOT in dirty_hooks (phase is `:validate`, not
-  `:pending`)
-- Atomic upgrade check passes (dirty_hooks is empty)
-- But falls back to non-atomic because `require_atomic? false`
-- after_transaction hook executes successfully in non-atomic path
-
-**Question**: Why did it fall back if dirty_hooks was empty?
-
-- Must investigate atomic upgrade logic for other failure reasons
-
-### Test 2: after_action Hook
-
-**Execution Log**:
-
-```
-=== AddAfterActionDuringPending.change/3 called ===
-Phase: :validate
-Dirty hooks before: []
-Dirty hooks after: []
-after_action list: 1 hooks
-atomic_after_action list: 0 hooks      ← STILL EMPTY!
-
-=== ATOMIC UPGRADE CHECK ===
-Action: update_with_after_action
-All dirty_hooks: []                    ← CLEAN!
-dirty_hooks (excluding after_action): []
-after_action hooks: 1
-atomic_after_action hooks: 0           ← EMPTY!
-after_transaction hooks: 0
-
-=== AddAfterActionDuringPending.atomic/3 called ===  ← ATOMIC SUCCEEDED!
-```
-
-**Result**: ❌ Test FAILED - `after_action` hook never executed
-
-**Analysis**:
-
-- dirty_hooks is completely empty (no interference)
-- `atomic/3` callback WAS CALLED - **atomic upgrade succeeded!**
-- But `after_action` hook never executed
-- Because `atomic_after_action` is empty (0 hooks)
-
-**Flow**:
-
-1. Original changeset: `after_action: [hook]`, `atomic_after_action: []`
-2. Atomic upgrade transfers from `atomic_after_action` (empty)
-3. New atomic changeset: `after_action: []`
-4. Atomic execution completes with no hooks
-5. Hook never runs
-
-**Proof**: The `atomic/3` callback being invoked confirms atomic execution
-succeeded.
-
----
-
-## FINAL CONCLUSIONS
-
-### 1. The atomic_after_action Mechanism is BROKEN for Action Changes
-
-**Expected**:
-
-- Hooks added during `:pending` phase go into both `after_action` and
-  `atomic_after_action`
-- During atomic upgrade, `atomic_after_action` hooks are transferred
-- Hooks execute after atomic operation completes
-
-**Reality**:
-
-- Action changes run during `:validate` phase (not `:pending`)
-- Hooks only go into `after_action`, NOT `atomic_after_action`
-- `atomic_after_action` remains empty
-- During atomic upgrade, NO hooks are transferred (empty list)
-- **Hooks are silently lost during atomic execution**
-
-### 2. after_transaction Does NOT Prevent Atomic Upgrade
-
-**Previous Assumption**: `after_transaction` hooks prevent atomic upgrade via
-dirty_hooks
-
-**Reality**:
-
-- `after_transaction` hooks are NOT added to dirty_hooks (phase is `:validate`)
-- dirty_hooks remains empty
-- Atomic upgrade check passes
-- The hook exists on the changeset but doesn't block atomic execution
-
-**Question**: Why does the test with `after_transaction` fall back to
-non-atomic?
-
-- Need to investigate other atomic upgrade failure conditions
-
-### 3. Atomic Upgrade SUCCEEDS When dirty_hooks is Empty
-
-With clean resource (no identities):
-
-- ✅ dirty_hooks: `[]`
-- ✅ Atomic upgrade proceeds
-- ✅ `atomic/3` callback executes
-- ❌ But hooks are lost because `atomic_after_action` is empty
-
-### 4. The REAL Behavior Summary
-
-| Hook Type                             | Added to dirty_hooks?      | Added to atomic_after_action? | Atomic Upgrade | Hook Executes?                    | Notes                                  |
-| ------------------------------------- | -------------------------- | ----------------------------- | -------------- | --------------------------------- | -------------------------------------- |
-| after_action (via action change)      | ❌ No (phase is :validate) | ❌ No (phase is :validate)    | ✅ Succeeds    | ✅ **Works if added in atomic/3** | Must use 2-arity signature in atomic/3 |
-| after_transaction (via action change) | ❌ No (phase is :validate) | N/A                           | ❓ Unknown\*   | ❌ **Not supported in atomic**    | Investigation needed                   |
-
-\*Falls back for unknown reason despite passing dirty_hooks check
-
----
-
-## RESOLUTION: NOT A BUG - CORRECT USAGE PATTERN IDENTIFIED
-
-**Initial Assumption (INCORRECT):** The `atomic_after_action` mechanism was
-believed to be broken because hooks added in `change/3` were not executing
-during atomic operations.
-
-**Actual Behavior (CORRECT):** For atomic execution, `after_action` hooks must
-be added in the `atomic/3` callback, not in `change/3`. This is the intended
-design.
-
-### Correct Usage Pattern
-
-```elixir
-defmodule MyChange do
-  use Ash.Resource.Change
-
-  def change(changeset, _opts, _context) do
-    # For non-atomic execution
-    Ash.Changeset.after_action(changeset, fn _changeset, result, _context ->
-      # 3-arity signature for non-atomic
-      {:ok, result}
-    end)
-  end
-
-  def atomic(changeset, _opts, _context) do
-    # For atomic execution - add hook here
-    changeset =
-      Ash.Changeset.after_action(changeset, fn _changeset, result ->
-        # 2-arity signature for atomic (no context parameter)
-        {:ok, result}
-      end)
-
-    {:atomic, changeset, %{}}
-  end
-end
-```
-
-### Key Learnings
-
-1. **`after_action` hooks for atomic operations must be added in `atomic/3`**
-
-   - Return `{:atomic, changeset, %{}}` to include the modified changeset
-
-2. **Hook signatures differ between atomic and non-atomic:**
-
-   - Non-atomic: `fn changeset, result, context ->`
-   - Atomic: `fn changeset, result ->` (no context parameter)
-
-3. **The `atomic_after_action` list is for internal use:**
-   - Populated when hooks are added during `:pending` phase
-   - Not intended for hooks added by action changes during `:validate` phase
-   - Users should add hooks in `atomic/3` for atomic execution
-
-This is **not a bug** - it's the correct design pattern for atomic operations.
-
----
-
-## NEXT: after_transaction Support for Atomic Operations
-
-### Current Status
-
-The `after_transaction` hook behavior with atomic operations is **not yet fully
-understood**:
-
-1. **Known Facts:**
-
-   - `after_transaction` hooks are NOT added to `dirty_hooks` (phase is
-     `:validate`)
-   - They DO NOT prevent atomic upgrade via the explicit dirty_hooks check
-   - The atomic upgrade check passes (no errors about dirty_hooks)
-   - Yet atomic operations fall back to non-atomic for unknown reasons
-
-2. **Unknown:**
-
-   - **WHY does atomic fallback occur when `after_transaction` hooks are
-     present?**
-   - Which condition in the atomic upgrade pipeline causes this?
-   - Is this intentional behavior or a side effect?
-   - Can we make `after_transaction` work with atomic operations?
-
-3. **Goal:**
-   - Get `after_transaction` hooks working with atomic operations
-   - Understand the mechanism that causes fallback
-   - Implement support if it's missing
-   - Document the correct usage pattern
-
-### Investigation Tasks
-
-1. **Find the fallback trigger:**
-
-   - Review all conditions in `fully_atomic_changeset/4` that return
-     `{:not_atomic, reason}`
-   - Add instrumentation to identify which condition triggers with
-     `after_transaction`
-   - Check if transaction hooks have explicit blocking logic
-
-2. **Understand transaction hook lifecycle:**
-
-   - When should `after_transaction` run relative to atomic operations?
-   - Do atomic operations even have transactions?
-   - What's the semantic difference between atomic and transactional?
-
-3. **Research existing patterns:**
-
-   - Look at how batch operations handle transactions
-   - Check if `before_transaction`/`around_transaction` have similar issues
-   - See if there are any existing atomic transaction hooks
-
-4. **Design the solution:**
-   - Determine if hooks should be added in `atomic/3` callback (like
-     `after_action`)
-   - Or if they need a different mechanism (like batch transaction callbacks)
-   - Consider the `before_batch_transaction`/`after_batch_transaction` pattern
-
-### Files to Investigate
-
-- `/home/joba/sandbox/ash/lib/ash/changeset/changeset.ex` - Hook registration,
-  phase lifecycle
-- `/home/joba/sandbox/ash/lib/ash/actions/update/update.ex` - Atomic upgrade
-  logic
-- `/home/joba/sandbox/ash/lib/ash/actions/update/bulk.ex` - Bulk atomic
-  operations with transactions
-- `/home/joba/sandbox/ash/lib/ash/resource/change.ex` - Change behavior
-  definitions
-
-### Test Strategy
-
-Create tests to verify:
-
-1. Atomic operations with `after_transaction` hooks (currently fails/falls back)
-2. Correct way to add transaction hooks in atomic context
-3. Hook execution order: atomic operation → transaction → after_transaction hook

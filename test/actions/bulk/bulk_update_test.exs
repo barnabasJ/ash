@@ -2273,13 +2273,15 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
         |> Ash.Changeset.for_create(:create, %{title: "test"})
         |> Ash.create!()
 
-      SimplePost
-      |> Ash.Query.filter(id == ^post.id)
-      |> Ash.bulk_update(:update_with_after_action, %{},
-        strategy: [:atomic],
-        return_records?: true
-      )
+      result =
+        SimplePost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(:update_with_after_action, %{},
+          strategy: [:atomic]
+          # return_records?: true  # REMOVED TO TEST AUTOMATIC CALCULATION
+        )
 
+      IO.inspect(result, label: "RESULT")
       assert_receive {:atomic_upgrade_after_action_called, _}, 100
     end
   end

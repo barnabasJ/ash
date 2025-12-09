@@ -19,7 +19,11 @@ defmodule Ash.Actions.Helpers do
   def split_and_run_simple(batch, action, opts, changes, all_changes, context_key, callback) do
     {batch, must_be_simple} =
       Enum.reduce(batch, {[], []}, fn changeset, {batch, must_be_simple} ->
-        if changeset.around_transaction in [[], nil] and changeset.after_transaction in [[], nil] and
+        # Note: We don't check after_transaction here because bulk operations
+        # handle after_transaction hooks in process_results via run_after_transactions.
+        # Only around_transaction and around_action require the simple path since
+        # they need to wrap the entire operation.
+        if changeset.around_transaction in [[], nil] and
              changeset.around_action in [[], nil] do
           changeset =
             if changeset.valid? do

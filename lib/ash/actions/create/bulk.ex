@@ -569,6 +569,14 @@ defmodule Ash.Actions.Create.Bulk do
     batch =
       Enum.reject(batch, fn
         %{valid?: false} = changeset ->
+          # Run after_transaction hooks for failed changesets
+          if changeset.after_transaction != [] do
+            Ash.Changeset.run_after_transactions(
+              {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+              changeset
+            )
+          end
+
           store_error(ref, changeset, opts)
           true
 
@@ -1124,6 +1132,14 @@ defmodule Ash.Actions.Create.Bulk do
     end)
     |> Enum.reject(fn
       %{valid?: false} = changeset ->
+        # Run after_transaction hooks for failed changesets
+        if changeset.after_transaction != [] do
+          Ash.Changeset.run_after_transactions(
+            {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+            changeset
+          )
+        end
+
         store_error(ref, changeset, opts)
         true
 

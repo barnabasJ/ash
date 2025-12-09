@@ -587,6 +587,9 @@ defmodule Ash.Actions.Destroy.Bulk do
         !Enum.empty?(atomic_changeset.after_action) ||
         !Enum.empty?(atomic_changeset.after_transaction)
 
+    # Update opts with calculated return_records? so handle_bulk_result uses it
+    opts = Keyword.put(opts, :return_records?, return_records?)
+
     destroy_query_opts =
       opts
       |> Keyword.take([:tenant, :select])
@@ -1534,6 +1537,14 @@ defmodule Ash.Actions.Destroy.Bulk do
     batch =
       Enum.reject(batch, fn
         %{valid?: false} = changeset ->
+          # Run after_transaction hooks for failed changesets
+          if changeset.after_transaction != [] do
+            Ash.Changeset.run_after_transactions(
+              {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+              changeset
+            )
+          end
+
           store_error(ref, changeset, opts)
           true
 
@@ -1928,7 +1939,10 @@ defmodule Ash.Actions.Destroy.Bulk do
   defp handle_bulk_result(stream, _, _, _), do: stream
 
   defp ensure_records_return_type(result, opts) do
-    if opts[:return_records?] do
+    # If records were actually loaded (non-empty list), preserve them even if opts[:return_records?] is false.
+    # This handles cases where return_records? was automatically calculated based on hooks in do_stream_batches.
+    # We check is_list and not empty? to distinguish between actual records and placeholder empty lists.
+    if opts[:return_records?] || (is_list(result.records) && result.records != []) do
       %{result | records: result.records || []}
     else
       %{result | records: nil}
@@ -2007,6 +2021,14 @@ defmodule Ash.Actions.Destroy.Bulk do
     end)
     |> Enum.reject(fn
       %{valid?: false} = changeset ->
+        # Run after_transaction hooks for failed changesets
+        if changeset.after_transaction != [] do
+          Ash.Changeset.run_after_transactions(
+            {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+            changeset
+          )
+        end
+
         store_error(ref, changeset, opts)
         true
 

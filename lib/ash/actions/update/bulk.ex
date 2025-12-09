@@ -611,16 +611,16 @@ defmodule Ash.Actions.Update.Bulk do
         MapSet.to_list(Ash.Resource.Info.attribute_names(atomic_changeset.resource))
       end
 
+    return_records? =
+      has_after_batch_hooks? || opts[:notify?] || opts[:return_records?] ||
+        !Enum.empty?(atomic_changeset.after_action) ||
+        !Enum.empty?(atomic_changeset.after_transaction)
+
     update_query_opts =
       opts
       |> Keyword.take([:tenant])
       |> Map.new()
-      |> Map.put(
-        :return_records?,
-        has_after_batch_hooks? || opts[:notify?] || opts[:return_records?] ||
-          !Enum.empty?(atomic_changeset.after_action) ||
-          !Enum.empty?(atomic_changeset.after_transaction)
-      )
+      |> Map.put(:return_records?, return_records?)
       |> Map.put(:calculations, calculations)
       |> Map.put(
         :action_select,
@@ -804,7 +804,7 @@ defmodule Ash.Actions.Update.Bulk do
             notifications: notifications,
             errors: errors,
             records:
-              if opts[:return_records?] do
+              if return_records? do
                 results
               else
                 []

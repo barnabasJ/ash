@@ -58,6 +58,25 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
     end
   end
 
+  defmodule AtomicDestroyWithAfterAction do
+    @moduledoc """
+    Change module that adds after_action hooks for destroy actions.
+    Supports both stream and atomic strategies by adding hooks in both callbacks.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_action(changeset, fn _changeset, result ->
+        send(self(), {:after_action_destroy_called, result.id})
+        {:ok, result}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
   defmodule Author do
     @moduledoc false
     use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Ets
@@ -207,6 +226,10 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
 
       destroy :destroy_with_atomic_after_transaction do
         change AtomicDestroyWithAfterTransaction
+      end
+
+      destroy :destroy_with_atomic_after_action do
+        change AtomicDestroyWithAfterAction
       end
 
       destroy :destroy_with_policy do
@@ -1010,7 +1033,7 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
         Post
         |> Ash.Query.filter(id == ^post.id)
         |> Ash.bulk_destroy!(:destroy_with_atomic_after_transaction, %{},
-          return_records?: true,
+          # return_records?: true,  # REMOVED TO TEST AUTOMATIC CALCULATION
           strategy: :atomic
         )
 
@@ -1073,6 +1096,74 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
       assert result.status == :success
       assert_received {:after_transaction_destroy_called, post_id}
       assert post_id == post.id
+    end
+
+    test "after_transaction hooks work with list of records and atomic_batches strategy" do
+      # This tests the atomic_batches path with a list of records (not a query)
+      # and verifies that after_transaction hooks execute without explicit return_records?: true
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "batch post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Pass a list of records with atomic_batches strategy
+      # Do NOT set return_records?: true - it should be calculated automatically from hooks
+      result =
+        Ash.bulk_destroy!(
+          posts,
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: [:atomic_batches],
+          return_errors?: true
+        )
+
+      assert result.status == :success
+
+      # Verify all hooks executed
+      for post_id <- post_ids do
+        assert_received {:after_transaction_destroy_called, ^post_id}
+      end
+
+      # Verify all posts were destroyed
+      assert [] = Ash.read!(Post)
+    end
+
+    test "after_action hooks work with list of records and atomic_batches strategy" do
+      # This tests the atomic_batches path with a list of records (not a query)
+      # and verifies that after_action hooks execute without explicit return_records?: true
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "batch post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Pass a list of records with atomic_batches strategy
+      # Do NOT set return_records?: true - it should be calculated automatically from hooks
+      result =
+        Ash.bulk_destroy!(
+          posts,
+          :destroy_with_atomic_after_action,
+          %{},
+          strategy: [:atomic_batches],
+          return_errors?: true
+        )
+
+      assert result.status == :success
+
+      # Verify all hooks executed
+      for post_id <- post_ids do
+        assert_received {:after_action_destroy_called, ^post_id}
+      end
+
+      # Verify all posts were destroyed
+      assert [] = Ash.read!(Post)
     end
 
     test "empty result set doesn't cause errors with after_transaction hooks" do

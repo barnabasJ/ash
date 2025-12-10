@@ -214,12 +214,33 @@ defmodule Ash.Actions.Update.Bulk do
             end
         end
 
-      %Ash.Changeset{valid?: false, errors: errors} ->
-        %Ash.BulkResult{
-          status: :error,
-          error_count: 1,
-          errors: [Ash.Error.to_error_class(errors)]
-        }
+      %Ash.Changeset{valid?: false, errors: errors} = changeset ->
+        # Run after_transaction hooks for failed changesets
+        if changeset.after_transaction != [] do
+          case Ash.Changeset.run_after_transactions(
+                 {:error, Ash.Error.to_error_class(errors, changeset: changeset)},
+                 changeset
+               ) do
+            {:ok, result} ->
+              %Ash.BulkResult{
+                status: :success,
+                records: [result]
+              }
+
+            {:error, error} ->
+              %Ash.BulkResult{
+                status: :error,
+                error_count: 1,
+                errors: [error]
+              }
+          end
+        else
+          %Ash.BulkResult{
+            status: :error,
+            error_count: 1,
+            errors: [Ash.Error.to_error_class(errors)]
+          }
+        end
 
       atomic_changeset ->
         atomic_changeset =
@@ -906,22 +927,49 @@ defmodule Ash.Actions.Update.Bulk do
           end
       end
     else
-      %Ash.Changeset{valid?: false, errors: error} ->
+      %Ash.Changeset{valid?: false, errors: error} = changeset ->
         if Ash.DataLayer.in_transaction?(atomic_changeset.resource) do
           Ash.DataLayer.rollback(atomic_changeset.resource, Ash.Error.to_error_class(error))
         else
-          %Ash.BulkResult{
-            status: :error,
-            error_count: 1,
-            notifications: [],
-            errors: [
-              Ash.Error.to_error_class(error,
-                bread_crumbs: [
-                  "Returned from bulk query update: #{inspect(atomic_changeset.resource)}.#{atomic_changeset.action.name}"
-                ]
-              )
-            ]
-          }
+          # Run after_transaction hooks for failed changesets
+          if changeset.after_transaction != [] do
+            case Ash.Changeset.run_after_transactions(
+                   {:error,
+                    Ash.Error.to_error_class(error,
+                      bread_crumbs: [
+                        "Returned from bulk query update: #{inspect(atomic_changeset.resource)}.#{atomic_changeset.action.name}"
+                      ]
+                    )},
+                   changeset
+                 ) do
+              {:ok, result} ->
+                %Ash.BulkResult{
+                  status: :success,
+                  records: [result]
+                }
+
+              {:error, hook_error} ->
+                %Ash.BulkResult{
+                  status: :error,
+                  error_count: 1,
+                  notifications: [],
+                  errors: [hook_error]
+                }
+            end
+          else
+            %Ash.BulkResult{
+              status: :error,
+              error_count: 1,
+              notifications: [],
+              errors: [
+                Ash.Error.to_error_class(error,
+                  bread_crumbs: [
+                    "Returned from bulk query update: #{inspect(atomic_changeset.resource)}.#{atomic_changeset.action.name}"
+                  ]
+                )
+              ]
+            }
+          end
         end
 
       {:error, %Ash.Error.Forbidden.InitialDataRequired{} = e} ->

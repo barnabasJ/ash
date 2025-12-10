@@ -100,6 +100,60 @@ defmodule Ash.Test.Actions.BulkCreateTest do
     end
   end
 
+  defmodule AfterTransactionChange do
+    @moduledoc """
+    Change module that adds after_transaction hooks for create actions.
+    Sends a message to verify the hook executed.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:after_transaction_create_called, result.id})
+        {:ok, result}
+      end)
+    end
+  end
+
+  defmodule AfterTransactionReturnsError do
+    @moduledoc """
+    Change module where after_transaction hook returns an error on success.
+    Used to test that hook errors are captured properly.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          send(self(), {:after_transaction_create_returning_error, result.id})
+          {:error, "Hook intentionally returned error"}
+
+        _changeset, {:error, error} ->
+          {:error, error}
+      end)
+    end
+  end
+
+  defmodule MultipleAfterTransactionHooks do
+    @moduledoc """
+    Change module that adds multiple after_transaction hooks.
+    Used to test execution order.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      changeset
+      |> Ash.Changeset.after_transaction(fn _changeset, {:ok, result} ->
+        send(self(), {:hook_1_executed, result.id})
+        {:ok, result}
+      end)
+      |> Ash.Changeset.after_transaction(fn _changeset, {:ok, result} ->
+        send(self(), {:hook_2_executed, result.id})
+        {:ok, result}
+      end)
+    end
+  end
+
   defmodule Org do
     @moduledoc false
     use Ash.Resource,
@@ -291,6 +345,18 @@ defmodule Ash.Test.Actions.BulkCreateTest do
                    send(self(), {:error, error})
                    {:error, error}
                end)
+      end
+
+      create :create_with_after_transaction_hook do
+        change AfterTransactionChange
+      end
+
+      create :create_with_after_transaction_returns_error do
+        change AfterTransactionReturnsError
+      end
+
+      create :create_with_multiple_hooks do
+        change MultipleAfterTransactionHooks
       end
 
       create :create_with_policy do
@@ -1247,6 +1313,105 @@ defmodule Ash.Test.Actions.BulkCreateTest do
 
     assert_receive {:error, _error}
     assert_receive {:error, _error}
+  end
+
+  test "after_transaction hooks work with return_stream?" do
+    org =
+      Org
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.create!()
+
+    # return_stream?: true streams results back
+    result_stream =
+      Ash.bulk_create(
+        [%{title: "title1"}, %{title: "title2"}, %{title: "title3"}],
+        Post,
+        :create_with_after_transaction_hook,
+        tenant: org.id,
+        return_stream?: true,
+        return_records?: true,
+        authorize?: false
+      )
+
+    # Consume the stream
+    results = Enum.to_list(result_stream)
+    assert length(results) == 3
+
+    # Verify hooks executed (use assert_receive with timeout for async operations)
+    assert_receive {:after_transaction_create_called, _id1}, 1000
+    assert_receive {:after_transaction_create_called, _id2}, 1000
+    assert_receive {:after_transaction_create_called, _id3}, 1000
+  end
+
+  test "after_transaction hooks handle empty result set" do
+    org =
+      Org
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.create!()
+
+    # Empty input - no records to create
+    result =
+      Ash.bulk_create(
+        [],
+        Post,
+        :create_with_after_transaction_hook,
+        tenant: org.id,
+        return_records?: true,
+        authorize?: false
+      )
+
+    assert result.status == :success
+    assert result.records == []
+    # No hooks should execute since no records were created
+    refute_receive {:after_transaction_create_called, _}
+  end
+
+  test "after_transaction hook error is captured in result" do
+    org =
+      Org
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.create!()
+
+    # This action's hook returns an error even on success
+    result =
+      Ash.bulk_create(
+        [%{title: "test"}],
+        Post,
+        :create_with_after_transaction_returns_error,
+        tenant: org.id,
+        return_records?: true,
+        return_errors?: true,
+        authorize?: false
+      )
+
+    # The hook was called and returned an error
+    assert_receive {:after_transaction_create_returning_error, _id}, 1000
+
+    # The operation should show the error from the hook
+    assert result.error_count == 1
+  end
+
+  test "multiple after_transaction hooks execute in order" do
+    org =
+      Org
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.create!()
+
+    result =
+      Ash.bulk_create!(
+        [%{title: "test"}],
+        Post,
+        :create_with_multiple_hooks,
+        tenant: org.id,
+        return_records?: true,
+        authorize?: false
+      )
+
+    assert result.status == :success
+
+    # Verify hooks executed in order (hook_1 before hook_2)
+    assert_receive {:hook_1_executed, id}, 1000
+    assert_receive {:hook_2_executed, ^id}, 1000
   end
 
   describe "authorization" do

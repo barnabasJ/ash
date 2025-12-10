@@ -105,6 +105,67 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     end
   end
 
+  defmodule AtomicUpdateWithAfterTransactionHandlingErrors do
+    @moduledoc """
+    Change module that adds after_transaction hooks that handle both success and failure.
+    Supports both stream and atomic strategies.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          send(self(), {:after_transaction_update_success, result.id})
+          {:ok, result}
+
+        _changeset, {:error, error} ->
+          send(self(), {:after_transaction_update_error, error})
+          {:error, error}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
+  defmodule AtomicUpdateWithAfterTransactionReturnsError do
+    @moduledoc """
+    Change module where after_transaction hook returns an error on success.
+    Used to test that hook errors are captured properly.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          send(self(), {:after_transaction_hook_returning_error, result.id})
+          {:error, "Hook intentionally returned error"}
+
+        _changeset, {:error, error} ->
+          {:error, error}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
+  defmodule AlwaysFailsValidation do
+    use Ash.Resource.Validation
+
+    @impl true
+    def validate(_, _, _) do
+      {:error, field: :title, message: "always fails"}
+    end
+
+    @impl true
+    def atomic(_, _, _) do
+      {:error, field: :title, message: "always fails atomically"}
+    end
+  end
+
   defmodule AddAfterTransactionDuringPending do
     @moduledoc """
     This change adds an after_transaction hook and supports atomic execution.
@@ -113,29 +174,16 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     use Ash.Resource.Change
 
     def change(changeset, _opts, _context) do
-      IO.puts("\n=== AddAfterTransactionDuringPending.change/3 called ===")
-      IO.puts("Phase: #{inspect(changeset.phase)}")
-      IO.puts("Dirty hooks before: #{inspect(changeset.dirty_hooks)}")
-
-      changeset =
-        Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
-          IO.puts("\n=== after_transaction HOOK EXECUTED (from change/3) ===")
-          send(self(), {:atomic_upgrade_after_transaction_called, result.id})
-          {:ok, result}
-        end)
-
-      IO.puts("Dirty hooks after: #{inspect(changeset.dirty_hooks)}")
-      IO.puts("after_transaction list: #{inspect(length(changeset.after_transaction))} hooks")
-      changeset
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:atomic_upgrade_after_transaction_called, result.id})
+        {:ok, result}
+      end)
     end
 
     def atomic(changeset, _opts, _context) do
-      IO.puts("\n=== AddAfterTransactionDuringPending.atomic/3 called ===")
-
       # CORRECT PATTERN: Add the hook in atomic/3 for atomic execution
       {:ok,
        Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
-         IO.puts("\n=== after_transaction HOOK EXECUTED (from atomic/3) ===")
          send(self(), {:atomic_upgrade_after_transaction_called, result.id})
          {:ok, result}
        end)}
@@ -150,30 +198,16 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     use Ash.Resource.Change
 
     def change(changeset, _opts, _context) do
-      IO.puts("\n=== AddAfterActionDuringPending.change/3 called ===")
-      IO.puts("Phase: #{inspect(changeset.phase)}")
-      IO.puts("Dirty hooks before: #{inspect(changeset.dirty_hooks)}")
-
-      changeset =
-        Ash.Changeset.after_action(changeset, fn _changeset, result ->
-          IO.puts("\n=== after_action HOOK EXECUTED (from change/3) ===")
-          send(self(), {:atomic_upgrade_after_action_called, result.id})
-          {:ok, result}
-        end)
-
-      IO.puts("Dirty hooks after: #{inspect(changeset.dirty_hooks)}")
-      IO.puts("after_action list: #{inspect(length(changeset.after_action))} hooks")
-      IO.puts("atomic_after_action list: #{inspect(length(changeset.atomic_after_action))} hooks")
-      changeset
+      Ash.Changeset.after_action(changeset, fn _changeset, result ->
+        send(self(), {:atomic_upgrade_after_action_called, result.id})
+        {:ok, result}
+      end)
     end
 
     def atomic(changeset, _opts, _context) do
-      IO.puts("\n=== AddAfterActionDuringPending.atomic/3 called ===")
-
       # CORRECT PATTERN: Add the hook in atomic/3 for atomic execution
       {:ok,
        Ash.Changeset.after_action(changeset, fn _changeset, result ->
-         IO.puts("\n=== after_action HOOK EXECUTED (from atomic/3) ===")
          send(self(), {:atomic_upgrade_after_action_called, result.id})
          {:ok, result}
        end)}
@@ -493,6 +527,15 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
         # This action successfully upgrades to atomic with after_action hooks
         skip_global_validations? true
         change AddAfterActionDuringPending
+      end
+
+      update :update_with_atomic_after_transaction_always_fails do
+        change AtomicUpdateWithAfterTransactionHandlingErrors
+        validate AlwaysFailsValidation
+      end
+
+      update :update_with_atomic_after_transaction_returns_error do
+        change AtomicUpdateWithAfterTransactionReturnsError
       end
     end
 
@@ -1900,7 +1943,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
   end
 
   describe "atomic changes with after_transaction hooks" do
-    test "after_transaction hooks CAN be added in atomic changes and execute correctly" do
+    test "after_transaction hooks execute in atomic strategy" do
       post =
         Post
         |> Ash.Changeset.for_create(:create, %{title: "test"})
@@ -1911,24 +1954,38 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       result =
         Post
         |> Ash.Query.filter(id == ^post.id)
-        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
-          return_records?: true,
-          strategy: :atomic
-        )
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{}, strategy: :atomic)
 
       assert result.status == :success
-      assert length(result.records) == 1
 
       # Verify the hook executed by checking for the message
       assert_received {:after_transaction_called, post_id}
       assert post_id == post.id
     end
 
-    test "after_transaction hooks added during :pending phase allow atomic upgrade" do
-      IO.puts("\n\n" <> String.duplicate("=", 80))
-      IO.puts("TEST: after_transaction hooks ALLOW atomic upgrade")
-      IO.puts(String.duplicate("=", 80))
+    test "after_transaction hooks in atomic strategy return records when requested" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
 
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: :atomic,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+
+      # Verify the hook executed
+      assert_received {:after_transaction_called, post_id}
+      assert post_id == post.id
+    end
+
+    test "after_transaction hooks added during :pending phase allow atomic upgrade" do
       post =
         Post
         |> Ash.Changeset.for_create(:create, %{title: "test", title2: "test2"})
@@ -1951,13 +2008,9 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       # The after_transaction hook DID run (via atomic upgrade with hook transfer)
       assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
-
-      IO.puts("\n" <> String.duplicate("=", 80))
-      IO.puts("TEST COMPLETE: after_transaction allowed atomic upgrade")
-      IO.puts(String.duplicate("=", 80) <> "\n")
     end
 
-    test "after_transaction with :atomic_batches strategy works" do
+    test "after_transaction with :atomic_batches strategy - hooks execute" do
       posts =
         for i <- 1..5 do
           Post
@@ -1971,9 +2024,35 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
         Post
         |> Ash.Query.filter(id in ^post_ids)
         |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
-          return_records?: true,
           strategy: [:atomic_batches],
           batch_size: 2
+        )
+
+      assert result.status == :success
+
+      # Verify all hooks executed
+      for post_id <- post_ids do
+        assert_received {:after_transaction_called, ^post_id}
+      end
+    end
+
+    test "after_transaction with :atomic_batches strategy - returns records when requested" do
+      posts =
+        for i <- 1..5 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: [:atomic_batches],
+          batch_size: 2,
+          return_records?: true
         )
 
       assert result.status == :success
@@ -1995,10 +2074,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       result =
         Post
         |> Ash.Query.filter(id == ^post.id)
-        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
-          return_records?: true,
-          strategy: :atomic
-        )
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{}, strategy: :atomic)
 
       assert result.status == :success
       assert_received {:after_transaction_called, post_id}
@@ -2016,10 +2092,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       result =
         Post
         |> Ash.Query.filter(id == ^post.id)
-        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
-          return_records?: true,
-          strategy: :atomic
-        )
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{}, strategy: :atomic)
 
       assert result.status == :success
     end
@@ -2035,10 +2108,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       result =
         Post
         |> Ash.Query.filter(id == ^post.id)
-        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
-          return_records?: true,
-          strategy: :atomic
-        )
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{}, strategy: :atomic)
 
       assert result.status == :success
       assert_received {:after_transaction_called, _}
@@ -2075,12 +2145,10 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
         Post
         |> Ash.Query.filter(id == ^post.id)
         |> Ash.bulk_update(:update_with_atomic_upgrade_and_after_transaction, %{},
-          return_records?: true,
           strategy: [:stream]
         )
 
       assert result.status == :success
-      assert length(result.records) == 1
       assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
     end
 
@@ -2089,24 +2157,249 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       result =
         Post
         |> Ash.Query.filter(id == "nonexistent")
-        |> Ash.bulk_update(:update_with_atomic_after_transaction, %{},
-          return_records?: true,
-          strategy: :atomic
-        )
+        |> Ash.bulk_update(:update_with_atomic_after_transaction, %{}, strategy: :atomic)
 
       assert result.status == :success
       assert result.records == []
       # No hooks should execute since no records matched
       refute_received {:after_transaction_called, _}
     end
+
+    test "with explicit return_errors?: true returns errors list" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: :atomic,
+          return_errors?: true
+        )
+
+      assert result.status == :success
+      assert result.errors == []
+
+      # Verify hooks executed
+      for post_id <- post_ids do
+        assert_received {:after_transaction_called, ^post_id}
+      end
+    end
+
+    test "with both return_records?: true and return_errors?: true" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: :atomic,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+      assert result.errors == []
+
+      # Verify hooks executed
+      for post_id <- post_ids do
+        assert_received {:after_transaction_called, ^post_id}
+      end
+    end
+
+    test "with return_stream?: true streams results (:stream strategy) - after_action for comparison" do
+      posts =
+        for i <- 1..3 do
+          SimplePost
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # return_stream?: true only works with :stream strategy
+      result_stream =
+        SimplePost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(:update_with_after_action, %{},
+          strategy: :stream,
+          return_stream?: true,
+          return_records?: true
+        )
+
+      # Consume the stream
+      results = Enum.to_list(result_stream)
+      assert length(results) == 3
+
+      # Verify hooks executed (use assert_receive with timeout for async operations)
+      for post_id <- post_ids do
+        assert_receive {:atomic_upgrade_after_action_called, ^post_id}, 1000
+      end
+    end
+
+    test "with return_stream?: true streams results (:stream strategy) - after_transaction" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # return_stream?: true only works with :stream strategy
+      result_stream =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(:update_with_atomic_after_transaction, %{},
+          strategy: :stream,
+          return_stream?: true,
+          return_records?: true
+        )
+
+      # Consume the stream
+      results = Enum.to_list(result_stream)
+      assert length(results) == 3
+
+      # Verify hooks executed (use assert_receive with timeout for async operations)
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks run on failure with :atomic strategy" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      # This action has a validation that always fails
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(:update_with_atomic_after_transaction_always_fails, %{},
+          strategy: :atomic,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+      assert result.error_count == 1
+
+      # Verify the after_transaction hook received the error
+      assert_receive {:after_transaction_update_error, _error}, 1000
+
+      # Verify the post was NOT updated (operation failed)
+      assert [_] = Ash.read!(Post)
+    end
+
+    test "after_transaction hooks run on failure with :atomic_batches strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      # This action has a validation that always fails
+      # With atomic_batches, validation happens once before the batches run
+      result =
+        Post
+        |> Ash.Query.filter(id in ^Enum.map(posts, & &1.id))
+        |> Ash.bulk_update(:update_with_atomic_after_transaction_always_fails, %{},
+          strategy: [:atomic_batches],
+          return_errors?: true
+        )
+
+      assert result.status == :error
+      # Only 1 error because validation fails on the single atomic changeset
+      assert result.error_count == 1
+
+      # Verify hook received error (only one because atomic changeset is shared)
+      assert_receive {:after_transaction_update_error, _error}, 1000
+
+      # Verify posts were NOT updated (operation failed)
+      assert length(Ash.read!(Post)) == 3
+    end
+
+    test "after_transaction hooks run on failure with :stream strategy and return_stream?" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # With stream strategy and return_stream?, the operation is lazy
+      # We use an action that always fails validation
+      result_stream =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(:update_with_atomic_after_transaction_always_fails, %{},
+          strategy: :stream,
+          return_stream?: true,
+          return_errors?: true
+        )
+
+      # Consume the stream to trigger the operations
+      results = Enum.to_list(result_stream)
+
+      # Each record should fail and trigger its hook
+      assert length(results) == 3
+
+      for result <- results do
+        assert {:error, _} = result
+      end
+
+      # Verify hooks executed for each failed record
+      for _post_id <- post_ids do
+        assert_receive {:after_transaction_update_error, _error}, 1000
+      end
+
+      # Verify posts were NOT updated (all operations failed)
+      assert length(Ash.read!(Post)) == 3
+    end
+
+    test "after_transaction hook error on success is captured in result" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      # This action's hook returns an error even on success
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(:update_with_atomic_after_transaction_returns_error, %{},
+          strategy: :atomic,
+          return_errors?: true
+        )
+
+      # The hook was called and returned an error
+      assert_receive {:after_transaction_hook_returning_error, _post_id}, 1000
+
+      # The operation should show the error from the hook
+      assert result.error_count == 1
+    end
   end
 
   describe "clean atomic upgrade tests (no identity validation interference)" do
     test "CLEAN: after_transaction hooks allow atomic upgrade" do
-      IO.puts("\n\n" <> String.duplicate("=", 80))
-      IO.puts("CLEAN TEST: after_transaction hooks behavior")
-      IO.puts(String.duplicate("=", 80))
-
       simple_post =
         SimplePost
         |> Ash.Changeset.for_create(:create, %{title: "test", body: "body"})
@@ -2119,18 +2412,10 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       assert result.body == "updated"
       assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
-
-      IO.puts("\n" <> String.duplicate("=", 80))
-      IO.puts("CLEAN TEST COMPLETE")
-      IO.puts(String.duplicate("=", 80) <> "\n")
     end
 
     @tag :skip
     test "CLEAN: after_action hooks allow atomic upgrade" do
-      IO.puts("\n\n" <> String.duplicate("=", 80))
-      IO.puts("CLEAN TEST: after_action hooks behavior")
-      IO.puts(String.duplicate("=", 80))
-
       simple_post =
         SimplePost
         |> Ash.Changeset.for_create(:create, %{title: "test", body: "body"})
@@ -2143,10 +2428,6 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       assert result.body == "updated"
       assert_receive {:atomic_upgrade_after_action_called, _}, 100
-
-      IO.puts("\n" <> String.duplicate("=", 80))
-      IO.puts("CLEAN TEST COMPLETE")
-      IO.puts(String.duplicate("=", 80) <> "\n")
     end
 
     test "after_action hooks work with atomic upgrade when added in atomic/3" do
@@ -2188,8 +2469,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       Post
       |> Ash.Query.filter(id == ^post.id)
       |> Ash.bulk_update(:update_with_atomic_upgrade_and_after_transaction, %{},
-        strategy: [:stream],
-        return_records?: true
+        strategy: [:stream]
       )
 
       assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
@@ -2207,8 +2487,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       |> Ash.Query.filter(id in ^Enum.map(posts, & &1.id))
       |> Ash.bulk_update(:update_with_atomic_upgrade_and_after_transaction, %{},
         strategy: [:atomic_batches],
-        batch_size: 2,
-        return_records?: true
+        batch_size: 2
       )
 
       for p <- posts do
@@ -2225,10 +2504,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       SimplePost
       |> Ash.Query.filter(id == ^post.id)
-      |> Ash.bulk_update(:update_with_after_action, %{},
-        strategy: [:stream],
-        return_records?: true
-      )
+      |> Ash.bulk_update(:update_with_after_action, %{}, strategy: [:stream])
 
       assert_receive {:atomic_upgrade_after_action_called, _}, 100
     end
@@ -2243,10 +2519,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       SimplePost
       |> Ash.Query.filter(id == ^post.id)
-      |> Ash.bulk_update(:update_with_after_transaction, %{},
-        strategy: [:stream],
-        return_records?: true
-      )
+      |> Ash.bulk_update(:update_with_after_transaction, %{}, strategy: [:stream])
 
       assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
     end
@@ -2259,10 +2532,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       SimplePost
       |> Ash.Query.filter(id == ^post.id)
-      |> Ash.bulk_update(:update_with_after_transaction, %{},
-        strategy: [:atomic],
-        return_records?: true
-      )
+      |> Ash.bulk_update(:update_with_after_transaction, %{}, strategy: [:atomic])
 
       assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
     end

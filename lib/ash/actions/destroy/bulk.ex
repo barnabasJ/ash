@@ -222,12 +222,33 @@ defmodule Ash.Actions.Destroy.Bulk do
           end
         end
 
-      %Ash.Changeset{valid?: false, errors: errors} ->
-        %Ash.BulkResult{
-          status: :error,
-          error_count: 1,
-          errors: [Ash.Error.to_error_class(errors)]
-        }
+      %Ash.Changeset{valid?: false, errors: errors} = changeset ->
+        # Run after_transaction hooks for failed changesets
+        if changeset.after_transaction != [] do
+          case Ash.Changeset.run_after_transactions(
+                 {:error, Ash.Error.to_error_class(errors, changeset: changeset)},
+                 changeset
+               ) do
+            {:ok, result} ->
+              %Ash.BulkResult{
+                status: :success,
+                records: [result]
+              }
+
+            {:error, error} ->
+              %Ash.BulkResult{
+                status: :error,
+                error_count: 1,
+                errors: [error]
+              }
+          end
+        else
+          %Ash.BulkResult{
+            status: :error,
+            error_count: 1,
+            errors: [Ash.Error.to_error_class(errors)]
+          }
+        end
 
       atomic_changeset ->
         {atomic_changeset, opts} =
@@ -369,11 +390,32 @@ defmodule Ash.Actions.Destroy.Bulk do
               end
 
             {:error, error} ->
-              %Ash.BulkResult{
-                status: :error,
-                errors: [Ash.Error.to_ash_error(error)],
-                error_count: 1
-              }
+              # Run after_transaction hooks for failed atomic operations
+              if atomic_changeset.after_transaction != [] do
+                case Ash.Changeset.run_after_transactions(
+                       {:error, Ash.Error.to_ash_error(error)},
+                       atomic_changeset
+                     ) do
+                  {:ok, result} ->
+                    %Ash.BulkResult{
+                      status: :success,
+                      records: [result]
+                    }
+
+                  {:error, error} ->
+                    %Ash.BulkResult{
+                      status: :error,
+                      errors: [error],
+                      error_count: 1
+                    }
+                end
+              else
+                %Ash.BulkResult{
+                  status: :error,
+                  errors: [Ash.Error.to_ash_error(error)],
+                  error_count: 1
+                }
+              end
           end
         after
           if notify? do
@@ -931,6 +973,34 @@ defmodule Ash.Actions.Destroy.Bulk do
           end
 
         case fully_atomic_changeset do
+          %Ash.Changeset{valid?: false, errors: errors} = changeset ->
+            # Run after_transaction hooks for failed changesets
+            if changeset.after_transaction != [] do
+              case Ash.Changeset.run_after_transactions(
+                     {:error, Ash.Error.to_error_class(errors, changeset: changeset)},
+                     changeset
+                   ) do
+                {:ok, result} ->
+                  %Ash.BulkResult{
+                    status: :success,
+                    records: [result]
+                  }
+
+                {:error, error} ->
+                  %Ash.BulkResult{
+                    status: :error,
+                    error_count: 1,
+                    errors: [error]
+                  }
+              end
+            else
+              %Ash.BulkResult{
+                status: :error,
+                error_count: 1,
+                errors: [Ash.Error.to_error_class(errors)]
+              }
+            end
+
           %Ash.Changeset{} = atomic_changeset ->
             query =
               resource

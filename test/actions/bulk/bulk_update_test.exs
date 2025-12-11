@@ -2396,6 +2396,63 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       # The operation should show the error from the hook
       assert result.error_count == 1
     end
+
+    test "after_transaction hook error on success is captured with :atomic_batches strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # This action's hook returns an error even on success
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(:update_with_atomic_after_transaction_returns_error, %{},
+          strategy: [:atomic_batches],
+          return_errors?: true
+        )
+
+      # All hooks are called (one per record)
+      for _post_id <- post_ids do
+        assert_receive {:after_transaction_hook_returning_error, _}, 1000
+      end
+
+      # Hook errors are captured in the result
+      # Note: atomic_batches currently consolidates multiple errors into 1
+      assert result.status == :error
+      assert result.error_count == 1
+    end
+
+    test "after_transaction hook error on success is captured with :stream strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # This action's hook returns an error even on success
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(:update_with_atomic_after_transaction_returns_error, %{},
+          strategy: :stream,
+          return_errors?: true
+        )
+
+      # Stream strategy stops on first error, so only 1 hook is called
+      assert_receive {:after_transaction_hook_returning_error, _}, 1000
+
+      # Hook error is captured in the result
+      assert result.status == :error
+      assert result.error_count == 1
+    end
   end
 
   describe "clean atomic upgrade tests (no identity validation interference)" do
@@ -2553,6 +2610,168 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       IO.inspect(result, label: "RESULT")
       assert_receive {:atomic_upgrade_after_action_called, _}, 100
+    end
+  end
+
+  describe "after_transaction with notification options" do
+    test "after_transaction hooks work with return_notifications?: true and :atomic strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: :atomic,
+          return_records?: true,
+          return_notifications?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+      # Notifications should be returned
+      assert length(result.notifications) == 3
+
+      # Verify hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks work with return_notifications?: true and :stream strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: :stream,
+          return_records?: true,
+          return_notifications?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+      # Notifications should be returned
+      assert length(result.notifications) == 3
+
+      # Verify hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks work with notify?: true and :atomic strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: :atomic,
+          return_records?: true,
+          notify?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Notifications should be sent (via Notifier module)
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+
+      # Verify after_transaction hooks also executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks work with notify?: true and :stream strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: :stream,
+          return_records?: true,
+          notify?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Notifications should be sent (via Notifier module)
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+
+      # Verify after_transaction hooks also executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks work with notify?: true and :atomic_batches strategy" do
+      posts =
+        for i <- 1..5 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(:update_with_atomic_after_transaction, %{},
+          strategy: [:atomic_batches],
+          batch_size: 2,
+          return_records?: true,
+          notify?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 5
+
+      # Notifications should be sent (via Notifier module)
+      for _ <- 1..5 do
+        assert_received {:notification, _}
+      end
+
+      # Verify after_transaction hooks also executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_called, ^post_id}, 1000
+      end
     end
   end
 end

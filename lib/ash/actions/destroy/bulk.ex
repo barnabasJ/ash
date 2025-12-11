@@ -1042,8 +1042,7 @@ defmodule Ash.Actions.Destroy.Bulk do
                   stream,
                   action,
                   input,
-                  opts,
-                  not_atomic_reason
+                  opts
                 )
             end
 
@@ -1086,11 +1085,17 @@ defmodule Ash.Actions.Destroy.Bulk do
     end
   end
 
-  defp do_atomic_batches(atomic_changeset, domain, stream, action, input, opts, not_atomic_reason) do
+  defp do_atomic_batches(atomic_changeset, domain, stream, action, input, opts) do
     batch_size = opts[:batch_size] || 100
     resource = opts[:resource]
     ref = make_ref()
     pkey = Ash.Resource.Info.primary_key(resource)
+
+    # Calculate return_records? based on hooks - same logic as atomic path
+    return_records? =
+      opts[:notify?] || opts[:return_records?] ||
+        !Enum.empty?(atomic_changeset.after_action) ||
+        !Enum.empty?(atomic_changeset.after_transaction)
 
     stream
     |> Stream.chunk_every(batch_size)
@@ -1120,25 +1125,22 @@ defmodule Ash.Actions.Destroy.Bulk do
             query,
             action.name,
             input,
-            [
-              actor: opts[:actor],
-              authorize_query?: false,
-              authorize?: opts[:authorize?],
-              tenant: atomic_changeset.tenant,
-              tracer: opts[:tracer],
-              atomic_changeset: atomic_changeset,
-              return_errors?: opts[:return_errors?],
-              filter: opts[:filter],
-              load: opts[:load],
-              resource: opts[:resource],
-              return_notifications?: opts[:return_notifications?],
-              notify?: opts[:notify?],
-              read_action: read_action,
-              return_records?: opts[:return_records?],
-              allow_stream_with: opts[:allow_stream_with],
-              strategy: [:atomic]
-            ],
-            not_atomic_reason
+            actor: opts[:actor],
+            authorize_query?: false,
+            authorize?: opts[:authorize?],
+            tenant: atomic_changeset.tenant,
+            tracer: opts[:tracer],
+            atomic_changeset: atomic_changeset,
+            return_errors?: opts[:return_errors?],
+            filter: opts[:filter],
+            load: opts[:load],
+            resource: opts[:resource],
+            return_notifications?: opts[:return_notifications?],
+            notify?: opts[:notify?],
+            read_action: read_action,
+            return_records?: return_records?,
+            allow_stream_with: opts[:allow_stream_with],
+            strategy: [:atomic]
           )
           |> case do
             %Ash.BulkResult{

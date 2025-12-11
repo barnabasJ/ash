@@ -1414,6 +1414,93 @@ defmodule Ash.Test.Actions.BulkCreateTest do
     assert_receive {:hook_2_executed, ^id}, 1000
   end
 
+  test "after_transaction hooks work with return_stream? on failure" do
+    org =
+      Org
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.create!()
+
+    # Create with invalid data to trigger failure
+    result_stream =
+      Ash.bulk_create(
+        [%{title: 1}, %{title: 2}],
+        Post,
+        :create_with_after_transaction,
+        tenant: org.id,
+        return_stream?: true,
+        return_errors?: true,
+        authorize?: false
+      )
+
+    # Consume the stream
+    results = Enum.to_list(result_stream)
+
+    # Each record should fail
+    for result <- results do
+      assert {:error, _} = result
+    end
+
+    # Verify hooks executed for each failed record
+    assert_receive {:error, _error}, 1000
+    assert_receive {:error, _error}, 1000
+  end
+
+  test "after_transaction hooks work with return_notifications?: true" do
+    org =
+      Org
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.create!()
+
+    result =
+      Ash.bulk_create!(
+        [%{title: "test1"}, %{title: "test2"}],
+        Post,
+        :create_with_after_transaction_hook,
+        tenant: org.id,
+        return_records?: true,
+        return_notifications?: true,
+        authorize?: false
+      )
+
+    assert result.status == :success
+    assert length(result.records) == 2
+    # Notifications should be returned
+    assert length(result.notifications) == 2
+
+    # Verify hooks executed
+    assert_receive {:after_transaction_create_called, _id1}, 1000
+    assert_receive {:after_transaction_create_called, _id2}, 1000
+  end
+
+  test "after_transaction hooks work with notify?: true" do
+    org =
+      Org
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.create!()
+
+    result =
+      Ash.bulk_create!(
+        [%{title: "test1"}, %{title: "test2"}],
+        Post,
+        :create_with_after_transaction_hook,
+        tenant: org.id,
+        return_records?: true,
+        notify?: true,
+        authorize?: false
+      )
+
+    assert result.status == :success
+    assert length(result.records) == 2
+
+    # Notifications should be sent (via Notifier module)
+    assert_received {:notification, %{data: %{title: "test1"}}}
+    assert_received {:notification, %{data: %{title: "test2"}}}
+
+    # Verify after_transaction hooks also executed
+    assert_receive {:after_transaction_create_called, _id1}, 1000
+    assert_receive {:after_transaction_create_called, _id2}, 1000
+  end
+
   describe "authorization" do
     test "policy success results in successes" do
       org =

@@ -3087,5 +3087,43 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       assert "valid_title" in titles
       assert "recovered_from_after_action_failure" in titles
     end
+
+    test "after_action failure converted to success without transaction: :all" do
+      # Same test without transaction: :all to verify after_transaction hooks
+      # are called correctly outside of a wrapping transaction
+      valid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "valid_title"})
+        |> Ash.create!()
+
+      fail_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "fail_this_one"})
+        |> Ash.create!()
+
+      result =
+        Post
+        |> Ash.Query.filter(id in [^valid_post.id, ^fail_post.id])
+        |> Ash.bulk_update(
+          :update_with_after_action_failure_converted_to_success,
+          %{},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The after_transaction hook should have converted the after_action failure to success
+      assert_receive {:after_action_failed_converted_to_success}, 1000
+
+      # Both records should be returned
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+
+      # Verify both records are present
+      titles = Enum.map(result.records, & &1.title)
+      assert "valid_title" in titles
+      assert "recovered_from_after_action_failure" in titles
+    end
   end
 end

@@ -538,6 +538,9 @@ defmodule Ash.Actions.Update.Bulk do
             handle_bulk_result(bulk_result, metadata_key, opts)
 
           {:error, error} ->
+            # Note: after_transaction hooks are not called here because we don't have
+            # access to the changesets after a transaction rollback. The changesets
+            # were created inside do_run which runs inside the transaction.
             handle_bulk_result(
               %Ash.BulkResult{errors: [error], status: :error},
               metadata_key,

@@ -477,6 +477,39 @@ defmodule Ash.Test.Actions.BulkCreateTest do
     end
   end
 
+  defmodule MnesiaPost do
+    @moduledoc false
+    use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Mnesia
+
+    mnesia do
+      table :mnesia_post_creates
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string, allow_nil?: false, public?: true
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, :destroy, :create]
+
+      create :create_with_after_action_error_and_after_transaction do
+        # after_action returns error, triggering rollback
+        change after_action(fn _changeset, _result, _context ->
+                 send(self(), {:after_action_error_hook_called})
+                 {:error, "after_action hook error"}
+               end)
+
+        # after_transaction should still be called after the rollback
+        change after_transaction(fn _changeset, result, _context ->
+                 send(self(), {:after_transaction_called, result})
+                 result
+               end)
+      end
+    end
+  end
+
   defmodule Tenant do
     @doc false
     use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Ets
@@ -2182,5 +2215,48 @@ defmodule Ash.Test.Actions.BulkCreateTest do
                      return_errors?: true
                    )
                  end
+  end
+
+  describe "transaction: :all with rollback" do
+    setup do
+      on_exit(fn ->
+        capture_log(fn ->
+          :mnesia.stop()
+          :mnesia.delete_schema([node()])
+        end)
+      end)
+
+      capture_log(fn ->
+        Ash.DataLayer.Mnesia.start(Domain, [MnesiaPost])
+      end)
+
+      :ok
+    end
+
+    test "after_action error with rollback_on_error? triggers rollback and after_transaction is NOT called" do
+      result =
+        [%{title: "title1"}, %{title: "title2"}]
+        |> Ash.bulk_create(
+          MnesiaPost,
+          :create_with_after_action_error_and_after_transaction,
+          transaction: :all,
+          rollback_on_error?: true,
+          return_errors?: true
+        )
+
+      # The after_action hook should have been called (it triggers the rollback)
+      assert_receive {:after_action_error_hook_called}
+
+      # The transaction was rolled back, returns a BulkResult with error status
+      assert %Ash.BulkResult{status: :error, errors: [error]} = result
+      assert %Ash.Error.Unknown.UnknownError{error: "\"after_action hook error\""} = error
+
+      # after_transaction hook is NOT called because we don't have access to
+      # the changesets after a transaction rollback
+      refute_receive {:after_transaction_called, _}
+
+      # No records should exist because the transaction was rolled back
+      assert [] == MnesiaPost |> Ash.read!()
+    end
   end
 end

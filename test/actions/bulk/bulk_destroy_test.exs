@@ -180,6 +180,41 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
     end
   end
 
+  defmodule AfterActionFailsWithAfterTransaction do
+    @moduledoc """
+    Change module that adds an after_action hook that fails for specific records,
+    and an after_transaction hook that converts the error to success.
+    Used to test hook_success_results handling when changesets become invalid
+    during run_after_action_hooks inside run_batch.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      changeset
+      |> Ash.Changeset.after_action(fn _changeset, result ->
+        # Fail if title starts with "fail_"
+        if String.starts_with?(result.title || "", "fail_") do
+          {:error,
+           Ash.Error.Changes.InvalidAttribute.exception(
+             field: :title,
+             message: "title cannot start with fail_"
+           )}
+        else
+          {:ok, result}
+        end
+      end)
+      |> Ash.Changeset.after_transaction(fn
+        _changeset, {:ok, result} ->
+          {:ok, result}
+
+        changeset, {:error, _original_error} ->
+          send(self(), {:after_action_failed_converted_to_success})
+          # Return a "fake" success with the original data
+          {:ok, changeset.data}
+      end)
+    end
+  end
+
   defmodule AtomicDestroyWithAfterAction do
     @moduledoc """
     Change module that adds after_action hooks for destroy actions.
@@ -393,6 +428,10 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
 
       destroy :destroy_with_after_transaction_partial_failure do
         change AtomicDestroyWithAfterTransactionFailsForSomeRecords
+      end
+
+      destroy :destroy_with_after_action_failure_converted_to_success do
+        change AfterActionFailsWithAfterTransaction
       end
 
       destroy :destroy_with_policy do
@@ -1799,6 +1838,85 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
       error = hd(result.errors)
       # The error should contain "custom error from hook", not the original "always fails" error
       assert Exception.message(error) =~ "custom error from hook"
+    end
+
+    test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets" do
+      # Create posts - one valid, one that will become invalid via validation
+      valid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "valid_title"})
+        |> Ash.create!()
+
+      invalid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "will_be_invalid"})
+        |> Ash.create!()
+
+      # Destroy with a mix of valid and invalid data
+      # The invalid one's after_transaction hook should convert the error to success
+      result =
+        Post
+        |> Ash.Query.filter(id in [^valid_post.id, ^invalid_post.id])
+        |> Ash.Query.sort(:title)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_transaction_converts_error_to_success,
+          %{},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true,
+          sorted?: true
+        )
+
+      # The hook should have been called for the invalid changeset(s)
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # Both records should be returned - converted to success by the hook
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+    end
+
+    test "after_action failure converted to success in run_after_action_hooks with mixed valid/invalid" do
+      # This test exposes the bug where hook_success_results from after_action failures
+      # that are converted to success by after_transaction hooks are not properly handled.
+      # Create posts - one that will succeed, one that will fail in after_action
+      valid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "valid_title"})
+        |> Ash.create!()
+
+      fail_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "fail_this_one"})
+        |> Ash.create!()
+
+      # Destroy with an action that has after_action hook that fails for "fail_" prefixed titles
+      # and after_transaction hook that converts the error to success
+      result =
+        Post
+        |> Ash.Query.filter(id in [^valid_post.id, ^fail_post.id])
+        |> Ash.bulk_destroy(
+          :destroy_with_after_action_failure_converted_to_success,
+          %{},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The after_transaction hook should have converted the after_action failure to success
+      assert_receive {:after_action_failed_converted_to_success}, 1000
+
+      # Both records should be returned
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+
+      # Verify both records are present
+      titles = Enum.map(result.records, & &1.title)
+      assert "valid_title" in titles
+      assert "fail_this_one" in titles
     end
   end
 end

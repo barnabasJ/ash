@@ -355,6 +355,29 @@ defmodule Ash.Test.Actions.BulkCreateTest do
         change AfterTransactionReturnsError
       end
 
+      create :create_with_after_transaction_converts_error_to_success do
+        change after_transaction(fn
+                 _changeset, {:ok, result}, _context ->
+                   {:ok, result}
+
+                 changeset, {:error, _original_error}, _context ->
+                   send(self(), {:after_transaction_converted_error_to_success})
+                   # Return a "fake" success with a default record
+                   {:ok, %{changeset.data | id: Ash.UUID.generate(), title: "default_from_hook"}}
+               end)
+      end
+
+      create :create_with_after_transaction_modifies_error do
+        change after_transaction(fn
+                 _changeset, {:ok, result}, _context ->
+                   {:ok, result}
+
+                 _changeset, {:error, _original_error}, _context ->
+                   send(self(), {:after_transaction_modified_error})
+                   {:error, "custom error from hook"}
+               end)
+      end
+
       create :create_with_multiple_hooks do
         change MultipleAfterTransactionHooks
       end
@@ -1499,6 +1522,69 @@ defmodule Ash.Test.Actions.BulkCreateTest do
     # Verify after_transaction hooks also executed
     assert_receive {:after_transaction_create_called, _id1}, 1000
     assert_receive {:after_transaction_create_called, _id2}, 1000
+  end
+
+  describe "after_transaction hook return value for invalid changesets" do
+    test "hook can convert validation error to success" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create with invalid data (title is nil, but required)
+      # The after_transaction hook should convert the error to success
+      result =
+        Ash.bulk_create(
+          [%{title: nil}],
+          Post,
+          :create_with_after_transaction_converts_error_to_success,
+          tenant: org.id,
+          return_records?: true,
+          return_errors?: true,
+          authorize?: false
+        )
+
+      # The hook should have been called
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # The result should show success, not error
+      # This currently FAILS because the hook's return value is ignored
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 1
+      assert hd(result.records).title == "default_from_hook"
+    end
+
+    test "hook can modify validation error" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create with invalid data (title is nil, but required)
+      # The after_transaction hook should modify the error
+      result =
+        Ash.bulk_create(
+          [%{title: nil}],
+          Post,
+          :create_with_after_transaction_modifies_error,
+          tenant: org.id,
+          return_errors?: true,
+          authorize?: false
+        )
+
+      # The hook should have been called
+      assert_receive {:after_transaction_modified_error}, 1000
+
+      # The error should be the modified one from the hook, not the original validation error
+      # This currently FAILS because the hook's return value is ignored
+      assert result.error_count == 1
+      assert result.errors != []
+
+      error = hd(result.errors)
+      # The error should contain "custom error from hook", not the original "is required" error
+      assert Exception.message(error) =~ "custom error from hook"
+    end
   end
 
   describe "authorization" do

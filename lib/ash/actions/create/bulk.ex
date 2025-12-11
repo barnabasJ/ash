@@ -72,6 +72,7 @@ defmodule Ash.Actions.Create.Bulk do
           handle_bulk_result(bulk_result, resource, action, opts)
 
         {:error, error} ->
+          # TODO: maybe call after_transaction here as well
           {:error, error}
       end
     else
@@ -551,23 +552,36 @@ defmodule Ash.Actions.Create.Bulk do
         end
       )
 
-    batch =
-      Enum.reject(batch, fn
-        %{valid?: false} = changeset ->
-          # Run after_transaction hooks for failed changesets
+    {batch, hook_success_results} =
+      Enum.reduce(batch, {[], []}, fn
+        %{valid?: false} = changeset, {batch_acc, results_acc} ->
+          # Run after_transaction hooks for failed changesets and respect return value
           if changeset.after_transaction != [] do
-            Ash.Changeset.run_after_transactions(
-              {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
-              changeset
-            )
+            case Ash.Changeset.run_after_transactions(
+                   {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+                   changeset
+                 ) do
+              {:ok, result} ->
+                # Hook converted error to success
+                Process.put({:any_success?, ref}, true)
+                {batch_acc, [result | results_acc]}
+
+              {:error, error} ->
+                # Hook returned error (possibly modified)
+                store_error(ref, error, opts)
+                {batch_acc, results_acc}
+            end
+          else
+            store_error(ref, changeset, opts)
+            {batch_acc, results_acc}
           end
 
-          store_error(ref, changeset, opts)
-          true
-
-        _changeset ->
-          false
+        changeset, {batch_acc, results_acc} ->
+          {[changeset | batch_acc], results_acc}
       end)
+
+    batch = Enum.reverse(batch)
+    must_be_simple_results = must_be_simple_results ++ Enum.reverse(hook_success_results)
 
     if opts[:transaction] == :batch &&
          Ash.DataLayer.data_layer_can?(resource, :transact) do
@@ -1096,27 +1110,40 @@ defmodule Ash.Actions.Create.Bulk do
         %Ash.Changeset{} = changeset -> changeset
       end
     end)
-    |> Enum.reject(fn
-      %{valid?: false} = changeset ->
-        # Run after_transaction hooks for failed changesets
+    |> Enum.reduce({[], []}, fn
+      %{valid?: false} = changeset, {batch_acc, results_acc} ->
+        # Run after_transaction hooks for failed changesets and respect return value
         if changeset.after_transaction != [] do
-          Ash.Changeset.run_after_transactions(
-            {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
-            changeset
-          )
+          case Ash.Changeset.run_after_transactions(
+                 {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+                 changeset
+               ) do
+            {:ok, result} ->
+              # Hook converted error to success
+              Process.put({:any_success?, ref}, true)
+              {batch_acc, [result | results_acc]}
+
+            {:error, error} ->
+              # Hook returned error (possibly modified)
+              store_error(ref, error, opts)
+              {batch_acc, results_acc}
+          end
+        else
+          store_error(ref, changeset, opts)
+          {batch_acc, results_acc}
         end
 
-        store_error(ref, changeset, opts)
-        true
-
-      _changeset ->
-        false
+      changeset, {batch_acc, results_acc} ->
+        {[changeset | batch_acc], results_acc}
+    end)
+    |> then(fn {batch, hook_success_results} ->
+      {Enum.reverse(batch), Enum.reverse(hook_success_results)}
     end)
     |> case do
-      [] ->
-        {[], changesets_by_ref, changesets_by_index}
+      {[], hook_success_results} ->
+        {hook_success_results, changesets_by_ref, changesets_by_index}
 
-      batch ->
+      {batch, hook_success_results} ->
         upsert_keys =
           if opts[:upsert?] || action.upsert? do
             case opts[:upsert_identity] || action.upsert_identity do
@@ -1368,7 +1395,7 @@ defmodule Ash.Actions.Create.Bulk do
               []
           end
         end)
-        |> then(&{&1, changesets_by_ref, changesets_by_index})
+        |> then(&{&1 ++ hook_success_results, changesets_by_ref, changesets_by_index})
     end
   end
 

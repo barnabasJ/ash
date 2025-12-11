@@ -44,3 +44,6 @@ shell.nix
 
 # Personal notes and planning documents
 notes/
+
+# Scratch files
+test/scratch_test.exs

@@ -152,6 +152,53 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     end
   end
 
+  defmodule AtomicUpdateWithAfterTransactionConvertsErrorToSuccess do
+    @moduledoc """
+    Change module where after_transaction hook converts validation error to success.
+    Used to test that hook return values are respected for invalid changesets.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          {:ok, result}
+
+        changeset, {:error, _original_error} ->
+          send(self(), {:after_transaction_converted_error_to_success})
+          # Return a "fake" success with the original data
+          {:ok, changeset.data}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
+  defmodule AtomicUpdateWithAfterTransactionModifiesError do
+    @moduledoc """
+    Change module where after_transaction hook modifies the error.
+    Used to test that hook return values are respected for invalid changesets.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          {:ok, result}
+
+        _changeset, {:error, _original_error} ->
+          send(self(), {:after_transaction_modified_error})
+          {:error, "custom error from hook"}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
   defmodule AlwaysFailsValidation do
     use Ash.Resource.Validation
 
@@ -536,6 +583,14 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
       update :update_with_atomic_after_transaction_returns_error do
         change AtomicUpdateWithAfterTransactionReturnsError
+      end
+
+      update :update_with_after_transaction_converts_error_to_success do
+        change AtomicUpdateWithAfterTransactionConvertsErrorToSuccess
+      end
+
+      update :update_with_after_transaction_modifies_error do
+        change AtomicUpdateWithAfterTransactionModifiesError
       end
     end
 
@@ -2471,7 +2526,6 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       assert_receive {:atomic_upgrade_after_transaction_called, _}, 100
     end
 
-    @tag :skip
     test "CLEAN: after_action hooks allow atomic upgrade" do
       simple_post =
         SimplePost
@@ -2772,6 +2826,68 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       for post_id <- post_ids do
         assert_receive {:after_transaction_called, ^post_id}, 1000
       end
+    end
+  end
+
+  describe "after_transaction hook return value for invalid changesets" do
+    test "hook can convert validation error to success" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      # Update with invalid data (title is nil, but required)
+      # The after_transaction hook should convert the error to success
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(
+          :update_with_after_transaction_converts_error_to_success,
+          %{title: nil},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The hook should have been called
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # The result should show success, not error
+      # This currently FAILS because the hook's return value is ignored
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 1
+    end
+
+    test "hook can modify validation error" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      # Update with invalid data (title is nil, but required)
+      # The after_transaction hook should modify the error
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(
+          :update_with_after_transaction_modifies_error,
+          %{title: nil},
+          strategy: :stream,
+          return_errors?: true
+        )
+
+      # The hook should have been called
+      assert_receive {:after_transaction_modified_error}, 1000
+
+      # The error should be the modified one from the hook, not the original validation error
+      # This currently FAILS because the hook's return value is ignored
+      assert result.error_count == 1
+      assert result.errors != []
+
+      error = hd(result.errors)
+      # The error should contain "custom error from hook", not the original "is required" error
+      assert Exception.message(error) =~ "custom error from hook"
     end
   end
 end

@@ -1606,23 +1606,41 @@ defmodule Ash.Actions.Destroy.Bulk do
         end
       )
 
-    batch =
-      Enum.reject(batch, fn
-        %{valid?: false} = changeset ->
+    {batch, hook_success_results} =
+      Enum.reduce(batch, {[], []}, fn
+        %{valid?: false} = changeset, {batch_acc, results_acc} ->
           # Run after_transaction hooks for failed changesets
           if changeset.after_transaction != [] do
-            Ash.Changeset.run_after_transactions(
-              {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
-              changeset
-            )
+            case Ash.Changeset.run_after_transactions(
+                   {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+                   changeset
+                 ) do
+              {:ok, result} ->
+                Process.put({:any_success?, ref}, true)
+
+                result_with_metadata =
+                  Ash.Resource.set_metadata(result, %{
+                    bulk_destroy_index: changeset.context.bulk_destroy.index,
+                    bulk_action_ref: changeset.context.bulk_destroy.ref
+                  })
+
+                {batch_acc, [result_with_metadata | results_acc]}
+
+              {:error, error} ->
+                store_error(ref, error, opts)
+                {batch_acc, results_acc}
+            end
+          else
+            store_error(ref, changeset, opts)
+            {batch_acc, results_acc}
           end
 
-          store_error(ref, changeset, opts)
-          true
-
-        _changeset ->
-          false
+        changeset, {batch_acc, results_acc} ->
+          {[changeset | batch_acc], results_acc}
       end)
+
+    batch = Enum.reverse(batch)
+    must_be_simple_results = must_be_simple_results ++ Enum.reverse(hook_success_results)
 
     if opts[:transaction] == :batch &&
          Ash.DataLayer.data_layer_can?(resource, :transact) do
@@ -2091,140 +2109,161 @@ defmodule Ash.Actions.Destroy.Bulk do
         changeset
       end
     end)
-    |> Enum.reject(fn
-      %{valid?: false} = changeset ->
+    |> Enum.reduce({[], []}, fn
+      %{valid?: false} = changeset, {batch_acc, results_acc} ->
         # Run after_transaction hooks for failed changesets
         if changeset.after_transaction != [] do
-          Ash.Changeset.run_after_transactions(
-            {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
-            changeset
-          )
-        end
-
-        store_error(ref, changeset, opts)
-        true
-
-      _changeset ->
-        false
-    end)
-    |> case do
-      [] ->
-        []
-
-      batch ->
-        batch
-        |> Enum.group_by(&{&1.atomics, &1.filter})
-        |> Enum.flat_map(fn {_atomics, batch} ->
-          result =
-            case action.manual do
-              {mod, manual_opts} ->
-                source_context =
-                  case batch do
-                    [cs | _] -> cs.context
-                    [] -> %{}
-                  end
-
-                if function_exported?(mod, :bulk_destroy, 3) do
-                  mod.bulk_destroy(batch, manual_opts, %Ash.Resource.ManualDestroy.BulkContext{
-                    actor: opts[:actor],
-                    select: opts[:select],
-                    source_context: source_context,
-                    batch_size: opts[:batch_size],
-                    authorize?: opts[:authorize?],
-                    tracer: opts[:tracer],
-                    domain: domain,
-                    return_records?:
-                      opts[:return_records?] || must_return_records? ||
-                        must_return_records_for_changes?,
-                    return_notifications?: opts[:return_notifications?] || false,
-                    return_errors?: opts[:return_errors?] || false,
-                    tenant: Ash.ToTenant.to_tenant(opts[:tenant], resource)
-                  })
-                else
-                  ctx =
-                    %Ash.Resource.ManualDestroy.Context{
-                      select: opts[:select],
-                      source_context: source_context,
-                      actor: opts[:actor],
-                      tenant: opts[:tenant],
-                      authorize?: opts[:authorize?],
-                      tracer: opts[:tracer],
-                      return_notifications?: opts[:return_notifications?] || false,
-                      return_destroyed?:
-                        opts[:return_records?] || must_return_records? ||
-                          must_return_records_for_changes?,
-                      domain: domain
-                    }
-
-                  [changeset] = batch
-
-                  [
-                    mod.destroy(changeset, manual_opts, ctx)
-                    |> Ash.Actions.BulkManualActionHelpers.process_non_bulk_result(
-                      changeset,
-                      :bulk_destroy
-                    )
-                  ]
-                end
-                |> Ash.Actions.Helpers.rollback_if_in_transaction(resource, nil)
-                |> Ash.Actions.BulkManualActionHelpers.process_bulk_results(
-                  mod,
-                  :bulk_destroy,
-                  &store_notification/3,
-                  &store_error/3,
-                  ref,
-                  opts
-                )
-
-              _ ->
-                [changeset] = batch
-
-                result =
-                  resource
-                  |> Ash.DataLayer.destroy(changeset)
-                  |> Ash.Actions.Helpers.rollback_if_in_transaction(resource, nil)
-
-                case result do
-                  :ok ->
-                    {:ok, data} = Ash.Changeset.apply_attributes(changeset, force?: true)
-
-                    {:ok,
-                     [
-                       data
-                       |> Ash.Resource.set_meta(%Ecto.Schema.Metadata{
-                         state: :deleted,
-                         schema: changeset.resource
-                       })
-                       |> Ash.Resource.put_metadata(
-                         :bulk_destroy_index,
-                         changeset.context.bulk_destroy.index
-                       )
-                       |> Ash.Resource.put_metadata(
-                         :bulk_action_ref,
-                         changeset.context.bulk_destroy.ref
-                       )
-                     ]}
-
-                  {:error, error} ->
-                    {:error, error}
-                end
-            end
-
-          case result do
-            {:error, %Ash.Error.Changes.StaleRecord{}} ->
-              []
-
+          case Ash.Changeset.run_after_transactions(
+                 {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+                 changeset
+               ) do
             {:ok, result} ->
               Process.put({:any_success?, ref}, true)
 
-              result
+              result_with_metadata =
+                Ash.Resource.set_metadata(result, %{
+                  bulk_destroy_index: changeset.context.bulk_destroy.index,
+                  bulk_action_ref: changeset.context.bulk_destroy.ref
+                })
+
+              {batch_acc, [result_with_metadata | results_acc]}
 
             {:error, error} ->
               store_error(ref, error, opts)
-
-              []
+              {batch_acc, results_acc}
           end
-        end)
+        else
+          store_error(ref, changeset, opts)
+          {batch_acc, results_acc}
+        end
+
+      changeset, {batch_acc, results_acc} ->
+        {[changeset | batch_acc], results_acc}
+    end)
+    |> then(fn {batch, hook_success_results} ->
+      {Enum.reverse(batch), Enum.reverse(hook_success_results)}
+    end)
+    |> case do
+      {[], hook_success_results} ->
+        hook_success_results
+
+      {batch, hook_success_results} ->
+        batch_results =
+          batch
+          |> Enum.group_by(&{&1.atomics, &1.filter})
+          |> Enum.flat_map(fn {_atomics, batch} ->
+            result =
+              case action.manual do
+                {mod, manual_opts} ->
+                  source_context =
+                    case batch do
+                      [cs | _] -> cs.context
+                      [] -> %{}
+                    end
+
+                  if function_exported?(mod, :bulk_destroy, 3) do
+                    mod.bulk_destroy(batch, manual_opts, %Ash.Resource.ManualDestroy.BulkContext{
+                      actor: opts[:actor],
+                      select: opts[:select],
+                      source_context: source_context,
+                      batch_size: opts[:batch_size],
+                      authorize?: opts[:authorize?],
+                      tracer: opts[:tracer],
+                      domain: domain,
+                      return_records?:
+                        opts[:return_records?] || must_return_records? ||
+                          must_return_records_for_changes?,
+                      return_notifications?: opts[:return_notifications?] || false,
+                      return_errors?: opts[:return_errors?] || false,
+                      tenant: Ash.ToTenant.to_tenant(opts[:tenant], resource)
+                    })
+                  else
+                    ctx =
+                      %Ash.Resource.ManualDestroy.Context{
+                        select: opts[:select],
+                        source_context: source_context,
+                        actor: opts[:actor],
+                        tenant: opts[:tenant],
+                        authorize?: opts[:authorize?],
+                        tracer: opts[:tracer],
+                        return_notifications?: opts[:return_notifications?] || false,
+                        return_destroyed?:
+                          opts[:return_records?] || must_return_records? ||
+                            must_return_records_for_changes?,
+                        domain: domain
+                      }
+
+                    [changeset] = batch
+
+                    [
+                      mod.destroy(changeset, manual_opts, ctx)
+                      |> Ash.Actions.BulkManualActionHelpers.process_non_bulk_result(
+                        changeset,
+                        :bulk_destroy
+                      )
+                    ]
+                  end
+                  |> Ash.Actions.Helpers.rollback_if_in_transaction(resource, nil)
+                  |> Ash.Actions.BulkManualActionHelpers.process_bulk_results(
+                    mod,
+                    :bulk_destroy,
+                    &store_notification/3,
+                    &store_error/3,
+                    ref,
+                    opts
+                  )
+
+                _ ->
+                  [changeset] = batch
+
+                  result =
+                    resource
+                    |> Ash.DataLayer.destroy(changeset)
+                    |> Ash.Actions.Helpers.rollback_if_in_transaction(resource, nil)
+
+                  case result do
+                    :ok ->
+                      {:ok, data} = Ash.Changeset.apply_attributes(changeset, force?: true)
+
+                      {:ok,
+                       [
+                         data
+                         |> Ash.Resource.set_meta(%Ecto.Schema.Metadata{
+                           state: :deleted,
+                           schema: changeset.resource
+                         })
+                         |> Ash.Resource.put_metadata(
+                           :bulk_destroy_index,
+                           changeset.context.bulk_destroy.index
+                         )
+                         |> Ash.Resource.put_metadata(
+                           :bulk_action_ref,
+                           changeset.context.bulk_destroy.ref
+                         )
+                       ]}
+
+                    {:error, error} ->
+                      {:error, error}
+                  end
+              end
+
+            case result do
+              {:error, %Ash.Error.Changes.StaleRecord{}} ->
+                []
+
+              {:ok, result} ->
+                Process.put({:any_success?, ref}, true)
+
+                result
+
+              {:error, error} ->
+                store_error(ref, error, opts)
+
+                []
+            end
+          end)
+
+        batch_results ++ hook_success_results
     end
   end
 

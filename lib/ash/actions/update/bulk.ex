@@ -341,7 +341,8 @@ defmodule Ash.Actions.Update.Bulk do
 
                   %{
                     bulk_result
-                    | records: Enum.reverse(processed_records),
+                    | # TODO: check if we need to set status to partial_success/error
+                      records: Enum.reverse(processed_records),
                       errors: bulk_result.errors ++ Enum.reverse(errors),
                       error_count: bulk_result.error_count + length(errors)
                   }
@@ -827,6 +828,7 @@ defmodule Ash.Actions.Update.Bulk do
             error_count: error_count,
             notifications: notifications,
             errors: errors,
+            # we only want to return the records if we asked for them
             records:
               if return_records? do
                 results
@@ -1947,23 +1949,49 @@ defmodule Ash.Actions.Update.Bulk do
         end
       )
 
-    batch =
-      Enum.reject(batch, fn
-        %{valid?: false} = changeset ->
+    # TODO: do this for the other actions as well
+    {batch, simple_results} =
+      Enum.reduce(batch, {[], []}, fn
+        %{valid?: false} = changeset, {batch, simple_results} ->
           # Run after_transaction hooks for failed changesets
           if changeset.after_transaction != [] do
             Ash.Changeset.run_after_transactions(
               {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
               changeset
             )
+            |> case do
+              {:ok, result} ->
+                Process.put({:any_success?, ref}, true)
+
+                {
+                  batch,
+                  [
+                    Ash.Resource.set_metadata(result, %{
+                      metadata_key =>
+                        changeset.context |> Map.get(context_key) |> Map.get(:index),
+                      ref_metadata_key =>
+                        changeset.context |> Map.get(context_key) |> Map.get(:ref)
+                    })
+                    | simple_results
+                  ]
+                }
+
+              {:error, hook_error} ->
+                store_error(ref, hook_error, opts)
+
+                {batch, simple_results}
+            end
+          else
+            store_error(ref, changeset, opts)
+            {batch, simple_results}
           end
 
-          store_error(ref, changeset, opts)
-          true
-
-        _changeset ->
-          false
+        changeset, {batch, simple_results} ->
+          {[changeset | batch], simple_results}
       end)
+
+    batch = Enum.reverse(batch)
+    must_be_simple_results = must_be_simple_results ++ Enum.reverse(simple_results)
 
     if opts[:transaction] == :batch &&
          Ash.DataLayer.data_layer_can?(resource, :transact) do
@@ -2628,27 +2656,48 @@ defmodule Ash.Actions.Update.Bulk do
 
     {changesets_by_ref, changesets_by_index} = index_changesets(batch, context_key)
 
-    batch =
-      batch
-      |> Enum.reject(fn
-        %{valid?: false} = changeset ->
-          # Run after_transaction hooks for failed changesets
+    {batch, hook_success_results} =
+      Enum.reduce(batch, {[], []}, fn
+        %{valid?: false} = changeset, {batch_acc, results_acc} ->
+          # Run after_transaction hooks for failed changesets and respect return value
           if changeset.after_transaction != [] do
-            Ash.Changeset.run_after_transactions(
-              {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
-              changeset
-            )
+            case Ash.Changeset.run_after_transactions(
+                   {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
+                   changeset
+                 ) do
+              {:ok, result} ->
+                # Hook converted error to success
+                Process.put({:any_success?, ref}, true)
+
+                result_with_metadata =
+                  Ash.Resource.set_metadata(result, %{
+                    metadata_key => changeset.context |> Map.get(context_key) |> Map.get(:index),
+                    ref_metadata_key => changeset.context |> Map.get(context_key) |> Map.get(:ref)
+                  })
+
+                {batch_acc, [result_with_metadata | results_acc]}
+
+              {:error, error} ->
+                # Hook returned error (possibly modified)
+                store_error(ref, error, opts)
+                {batch_acc, results_acc}
+            end
+          else
+            store_error(ref, changeset, opts)
+            {batch_acc, results_acc}
           end
 
-          store_error(ref, changeset, opts)
-          true
-
-        _changeset ->
-          false
+        changeset, {batch_acc, results_acc} ->
+          {[changeset | batch_acc], results_acc}
       end)
-      |> case do
+
+    batch = Enum.reverse(batch)
+    hook_success_results = Enum.reverse(hook_success_results)
+
+    batch =
+      case batch do
         [] ->
-          []
+          hook_success_results
 
         batch ->
           batch
@@ -2789,6 +2838,7 @@ defmodule Ash.Actions.Update.Bulk do
                 []
             end
           end)
+          |> Enum.concat(hook_success_results)
       end
 
     {batch, changesets_by_ref, changesets_by_index}

@@ -72,8 +72,15 @@ defmodule Ash.Actions.Create.Bulk do
           handle_bulk_result(bulk_result, resource, action, opts)
 
         {:error, error} ->
-          # TODO: maybe call after_transaction here as well
-          {:error, error}
+          # Note: after_transaction hooks are not called here because we don't have
+          # access to the changesets after a transaction rollback. The changesets
+          # were created inside do_run which runs inside the transaction.
+          handle_bulk_result(
+            %Ash.BulkResult{errors: [error], status: :error},
+            resource,
+            action,
+            opts
+          )
       end
     else
       domain

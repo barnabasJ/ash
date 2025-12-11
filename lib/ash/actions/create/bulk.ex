@@ -571,7 +571,13 @@ defmodule Ash.Actions.Create.Bulk do
               {:ok, result} ->
                 # Hook converted error to success
                 Process.put({:any_success?, ref}, true)
-                {batch_acc, [result | results_acc]}
+
+                result_with_index =
+                  Ash.Resource.set_metadata(result, %{
+                    bulk_create_index: changeset.context.bulk_create.index
+                  })
+
+                {batch_acc, [result_with_index | results_acc]}
 
               {:error, error} ->
                 # Hook returned error (possibly modified)
@@ -1128,7 +1134,13 @@ defmodule Ash.Actions.Create.Bulk do
             {:ok, result} ->
               # Hook converted error to success
               Process.put({:any_success?, ref}, true)
-              {batch_acc, [result | results_acc]}
+
+              result_with_index =
+                Ash.Resource.set_metadata(result, %{
+                  bulk_create_index: changeset.context.bulk_create.index
+                })
+
+              {batch_acc, [result_with_index | results_acc]}
 
             {:error, error} ->
               # Hook returned error (possibly modified)

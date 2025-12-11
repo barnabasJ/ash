@@ -341,11 +341,11 @@ defmodule Ash.Actions.Update.Bulk do
 
                   %{
                     bulk_result
-                    | # TODO: check if we need to set status to partial_success/error
-                      records: Enum.reverse(processed_records),
+                    | records: Enum.reverse(processed_records),
                       errors: bulk_result.errors ++ Enum.reverse(errors),
                       error_count: bulk_result.error_count + length(errors)
                   }
+                  |> Ash.BulkResult.recalculate_status()
                 end
 
               if opts[:return_notifications?] do
@@ -2539,6 +2539,7 @@ defmodule Ash.Actions.Update.Bulk do
     bulk_result
     |> sort(metadata_key, opts)
     |> clear_ref_metadata_from_records()
+    |> Ash.BulkResult.recalculate_status()
     |> ensure_records_return_type(opts)
     |> ensure_errors_return_type(opts)
   end
@@ -2565,7 +2566,8 @@ defmodule Ash.Actions.Update.Bulk do
     end
   end
 
-  defp sort(%{records: records} = result, metadata_key, opts) when is_list(records) do
+  defp sort(%{records: records} = result, metadata_key, opts)
+       when is_list(records) and not is_nil(metadata_key) do
     if opts[:sorted?] do
       %{result | records: Enum.sort_by(records, & &1.__metadata__[metadata_key])}
     else
@@ -2573,7 +2575,7 @@ defmodule Ash.Actions.Update.Bulk do
     end
   end
 
-  defp sort(result, _action, _), do: result
+  defp sort(result, _metadata_key, _opts), do: result
 
   defp run_batch(
          resource,

@@ -356,6 +356,7 @@ defmodule Ash.Actions.Destroy.Bulk do
                       errors: bulk_result.errors ++ Enum.reverse(errors),
                       error_count: bulk_result.error_count + length(errors)
                   }
+                  |> Ash.BulkResult.recalculate_status()
                 end
 
               if opts[:return_notifications?] do
@@ -2024,6 +2025,7 @@ defmodule Ash.Actions.Destroy.Bulk do
   defp handle_bulk_result(%Ash.BulkResult{} = bulk_result, _resource, _action, opts) do
     bulk_result
     |> sort(opts)
+    |> Ash.BulkResult.recalculate_status()
     |> ensure_records_return_type(opts)
     |> ensure_errors_return_type(opts)
   end

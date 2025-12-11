@@ -129,6 +129,34 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
     end
   end
 
+  defmodule AtomicDestroyWithAfterTransactionFailsForSomeRecords do
+    @moduledoc """
+    Change module where after_transaction hook returns an error for records with title containing "fail".
+    Used to test partial_success status when some records succeed and some fail.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          if String.contains?(result.title, "fail") do
+            send(self(), {:after_transaction_destroy_partial_failure, result.id})
+            {:error, "Hook failed for title containing 'fail'"}
+          else
+            send(self(), {:after_transaction_destroy_partial_success, result.id})
+            {:ok, result}
+          end
+
+        _changeset, {:error, error} ->
+          {:error, error}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
   defmodule AtomicDestroyWithAfterTransactionModifiesError do
     @moduledoc """
     Change module where after_transaction hook modifies the error.
@@ -361,6 +389,10 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
       destroy :destroy_with_after_transaction_modifies_error do
         change AtomicDestroyWithAfterTransactionModifiesError
         validate AlwaysFailsValidation
+      end
+
+      destroy :destroy_with_after_transaction_partial_failure do
+        change AtomicDestroyWithAfterTransactionFailsForSomeRecords
       end
 
       destroy :destroy_with_policy do
@@ -1442,14 +1474,18 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
         |> Ash.Query.filter(id == ^post.id)
         |> Ash.bulk_destroy(:destroy_with_atomic_after_transaction_returns_error, %{},
           strategy: :atomic,
-          return_errors?: true
+          return_errors?: true,
+          return_records?: true
         )
 
       # The hook was called and returned an error
       assert_receive {:after_transaction_hook_returning_error, _post_id}, 1000
 
-      # The operation should show the error from the hook
+      # The operation should show the error from the hook with correct status
+      assert result.status == :error
       assert result.error_count == 1
+      assert length(result.errors) == 1
+      assert result.records == []
     end
 
     test "after_transaction hook error is captured with :stream strategy" do
@@ -1657,6 +1693,50 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
 
       # Verify all posts were destroyed
       assert [] = Ash.read!(Post)
+    end
+
+    test "after_transaction hook partial failure sets status to :partial_success with :atomic strategy" do
+      # Create posts with different titles - some will fail, some will succeed
+      success_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "success"})
+        |> Ash.create!()
+
+      fail_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "will fail"})
+        |> Ash.create!()
+
+      another_success =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "also success"})
+        |> Ash.create!()
+
+      success_post_id = success_post.id
+      fail_post_id = fail_post.id
+      another_success_id = another_success.id
+      post_ids = [success_post_id, fail_post_id, another_success_id]
+
+      # This action's hook fails only for records with title containing "fail"
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy(:destroy_with_after_transaction_partial_failure, %{},
+          strategy: :atomic,
+          return_errors?: true,
+          return_records?: true
+        )
+
+      # The success hooks should have been called
+      assert_receive {:after_transaction_destroy_partial_success, ^success_post_id}, 1000
+      assert_receive {:after_transaction_destroy_partial_failure, ^fail_post_id}, 1000
+      assert_receive {:after_transaction_destroy_partial_success, ^another_success_id}, 1000
+
+      # Status should be partial_success since some records succeeded and some failed
+      assert result.status == :partial_success
+      assert result.error_count == 1
+      assert length(result.errors) == 1
+      assert length(result.records) == 2
     end
   end
 

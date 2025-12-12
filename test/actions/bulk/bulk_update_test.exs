@@ -236,6 +236,10 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     """
     use Ash.Resource.Change
 
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+
     def change(changeset, _opts, _context) do
       changeset
       |> Ash.Changeset.after_action(fn _changeset, result ->

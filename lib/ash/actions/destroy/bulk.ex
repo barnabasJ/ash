@@ -1702,12 +1702,33 @@ defmodule Ash.Actions.Destroy.Bulk do
           rollback_on_error?: false
         )
         |> case do
-          {:ok, result} ->
-            result
+          {:ok, {tagged_results, batch, changesets_by_ref, changesets_by_index}} ->
+            # process_results runs OUTSIDE transaction - after_transaction hooks run here
+            process_results(
+              tagged_results,
+              opts,
+              ref,
+              changesets_by_ref,
+              changesets_by_index,
+              batch,
+              domain,
+              resource,
+              base_changeset
+            )
+            |> Stream.concat(must_be_simple_results)
+            |> then(fn stream ->
+              if opts[:return_stream?] do
+                stream
+                |> Stream.map(&{:ok, &1})
+                |> Stream.concat(error_stream(ref))
+                |> Stream.concat(notification_stream(ref))
+              else
+                stream
+              end
+            end)
 
           {:error, error} ->
             store_error(ref, error, opts)
-
             []
         end
       after
@@ -1724,19 +1745,43 @@ defmodule Ash.Actions.Destroy.Bulk do
         end
       end
     else
-      do_handle_batch(
+      {tagged_results, batch, changesets_by_ref, changesets_by_index} =
+        do_handle_batch(
+          batch,
+          domain,
+          resource,
+          action,
+          opts,
+          all_changes,
+          ref,
+          base_changeset,
+          must_return_records_for_changes?,
+          changes,
+          must_be_simple_results
+        )
+
+      process_results(
+        tagged_results,
+        opts,
+        ref,
+        changesets_by_ref,
+        changesets_by_index,
         batch,
         domain,
         resource,
-        action,
-        opts,
-        all_changes,
-        ref,
-        base_changeset,
-        must_return_records_for_changes?,
-        changes,
-        must_be_simple_results
+        base_changeset
       )
+      |> Stream.concat(must_be_simple_results)
+      |> then(fn stream ->
+        if opts[:return_stream?] do
+          stream
+          |> Stream.map(&{:ok, &1})
+          |> Stream.concat(error_stream(ref))
+          |> Stream.concat(notification_stream(ref))
+        else
+          stream
+        end
+      end)
     end
   end
 
@@ -1748,10 +1793,10 @@ defmodule Ash.Actions.Destroy.Bulk do
          opts,
          all_changes,
          ref,
-         base_changeset,
+         _base_changeset,
          must_return_records_for_changes?,
          changes,
-         must_be_simple_results
+         _must_be_simple_results
        ) do
     must_return_records? =
       opts[:notify?] ||
@@ -1771,40 +1816,67 @@ defmodule Ash.Actions.Destroy.Bulk do
 
     {changesets_by_ref, changesets_by_index} = index_changesets(batch)
 
-    run_batch(
-      resource,
-      batch,
-      action,
-      opts,
-      must_return_records?,
-      must_return_records_for_changes?,
-      domain,
-      ref
-    )
-    |> run_after_action_hooks(opts, domain, ref, changesets_by_ref, changesets_by_index)
-    |> process_results(
-      changes,
-      all_changes,
-      opts,
-      ref,
-      changesets_by_ref,
-      changesets_by_index,
-      batch,
-      domain,
-      resource,
-      base_changeset
-    )
-    |> Stream.concat(must_be_simple_results)
-    |> then(fn stream ->
-      if opts[:return_stream?] do
-        stream
-        |> Stream.map(&{:ok, &1})
-        |> Stream.concat(error_stream(ref))
-        |> Stream.concat(notification_stream(ref))
-      else
-        stream
-      end
-    end)
+    tagged_results =
+      run_batch(
+        resource,
+        batch,
+        action,
+        opts,
+        must_return_records?,
+        must_return_records_for_changes?,
+        domain,
+        ref
+      )
+      |> run_after_action_hooks(opts, domain, ref, changesets_by_ref, changesets_by_index)
+
+    # Run bulk after_changes on successful results (inside transaction)
+    {success_results, success_changesets} =
+      Enum.reduce(tagged_results, {[], %{}}, fn
+        {:ok, result, changeset}, {results, changesets_map} ->
+          index = result.__metadata__[:bulk_destroy_index]
+          {[result | results], Map.put(changesets_map, index, changeset)}
+
+        {:error, _, _}, acc ->
+          acc
+      end)
+
+    success_results = Enum.reverse(success_results)
+
+    updated_success_results =
+      changes
+      |> Ash.Actions.Update.Bulk.run_bulk_after_changes(
+        all_changes,
+        success_results,
+        changesets_by_ref,
+        changesets_by_index,
+        batch,
+        opts,
+        ref,
+        resource,
+        :bulk_destroy_index,
+        :bulk_action_ref
+      )
+
+    # Rebuild tagged results with updated success results
+    updated_success_map =
+      Enum.reduce(updated_success_results, %{}, fn result, acc ->
+        index = result.__metadata__[:bulk_destroy_index]
+        Map.put(acc, index, result)
+      end)
+
+    tagged_results =
+      Enum.map(tagged_results, fn
+        {:ok, result, changeset} ->
+          index = result.__metadata__[:bulk_destroy_index]
+          updated_result = Map.get(updated_success_map, index, result)
+          updated_changeset = Map.get(success_changesets, index, changeset)
+          {:ok, updated_result, updated_changeset}
+
+        error_tuple ->
+          error_tuple
+      end)
+
+    {tagged_results, batch, changesets_by_ref, changesets_by_index}
   end
 
   defp setup_changeset(
@@ -2300,6 +2372,8 @@ defmodule Ash.Actions.Destroy.Bulk do
          changesets_by_ref,
          changesets_by_index
        ) do
+    # Returns list of {:ok, result, changeset} | {:error, error, changeset}
+    # so that process_results can call after_transaction on both successes and failures
     Enum.flat_map(batch_results, fn result ->
       changeset =
         Ash.Actions.Helpers.lookup_changeset(
@@ -2328,83 +2402,95 @@ defmodule Ash.Actions.Destroy.Bulk do
                 end
               end
 
-              store_error(ref, error, opts)
-              []
+              [{:error, error, changeset}]
 
-            {:ok, result, _changeset, %{notifications: more_new_notifications}} ->
+            {:ok, result, changeset, %{notifications: more_new_notifications}} ->
               store_notification(ref, more_new_notifications, opts)
-              [result]
+              [{:ok, result, changeset}]
           end
 
         {:error, error} ->
-          store_error(ref, error, opts)
-          []
+          [{:error, error, changeset}]
       end
     end)
   end
 
   defp process_results(
-         batch,
-         changes,
-         all_changes,
+         tagged_results,
          opts,
          ref,
-         changesets_by_ref,
-         changesets_by_index,
-         changesets,
+         _changesets_by_ref,
+         _changesets_by_index,
+         _changesets,
          domain,
          resource,
          base_changeset
        ) do
-    changes
-    |> Ash.Actions.Update.Bulk.run_bulk_after_changes(
-      all_changes,
-      batch,
-      changesets_by_ref,
-      changesets_by_index,
-      changesets,
-      opts,
-      ref,
-      resource,
-      :bulk_destroy_index,
-      :bulk_action_ref
-    )
-    |> Enum.flat_map(fn result ->
-      changeset =
-        Ash.Actions.Helpers.lookup_changeset(
-          result,
-          changesets_by_ref,
-          changesets_by_index,
-          index_key: :bulk_destroy_index,
-          ref_key: :bulk_action_ref
-        )
+    # tagged_results is now list of {:ok, result, changeset} | {:error, error, changeset}
+    # run_bulk_after_changes has already been called in do_handle_batch (inside transaction)
+    results =
+      Enum.flat_map(tagged_results, fn
+        {:ok, result, changeset} ->
+          if opts[:notify?] || opts[:return_notifications?] do
+            store_notification(ref, notification(changeset, result, opts), opts)
+          end
 
-      if opts[:notify?] || opts[:return_notifications?] do
-        store_notification(ref, notification(changeset, result, opts), opts)
-      end
+          try do
+            case Ash.Changeset.run_after_transactions({:ok, result}, changeset) do
+              {:ok, result} ->
+                if opts[:return_records?] do
+                  [
+                    Ash.Resource.set_metadata(result, %{
+                      bulk_destroy_index: changeset.context.bulk_destroy.index
+                    })
+                  ]
+                else
+                  []
+                end
 
-      try do
-        case Ash.Changeset.run_after_transactions(
-               {:ok, result},
-               changeset
-             ) do
-          {:ok, result} ->
-            if opts[:return_records?] do
-              [result]
-            else
-              []
+              {:error, error} ->
+                store_error(ref, error, opts)
+                []
             end
+          rescue
+            e ->
+              store_error(ref, e, opts)
+              []
+          end
 
-          {:error, error} ->
-            store_error(ref, error, opts)
-            []
-        end
-      rescue
-        e ->
-          store_error(ref, e, opts)
-          []
-      end
-    end)
+        {:error, error, changeset} ->
+          try do
+            case Ash.Changeset.run_after_transactions({:error, error}, changeset) do
+              {:ok, result} ->
+                # after_transaction converted error to success
+                Process.put({:any_success?, ref}, true)
+
+                if opts[:notify?] || opts[:return_notifications?] do
+                  store_notification(ref, notification(changeset, result, opts), opts)
+                end
+
+                if opts[:return_records?] do
+                  [
+                    Ash.Resource.set_metadata(result, %{
+                      bulk_destroy_index: changeset.context.bulk_destroy.index
+                    })
+                  ]
+                else
+                  []
+                end
+
+              {:error, error} ->
+                store_error(ref, error, opts)
+                []
+            end
+          rescue
+            e ->
+              store_error(ref, e, opts)
+              []
+          end
+      end)
+
+    results
     |> load_data(domain, resource, base_changeset, opts)
     |> case do
       {:ok, records} ->

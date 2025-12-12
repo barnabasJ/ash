@@ -189,6 +189,10 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
     """
     use Ash.Resource.Change
 
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+
     def change(changeset, _opts, _context) do
       changeset
       |> Ash.Changeset.after_action(fn _changeset, result ->
@@ -550,6 +554,25 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
     end
   end
 
+  defmodule MnesiaAfterTransactionChange do
+    @moduledoc """
+    Change module that adds after_transaction hook for Mnesia resource.
+    Used to test warning when after_transaction runs inside a transaction.
+    """
+    use Ash.Resource.Change
+
+    def atomic(changeset, _opts, _context) do
+      {:ok, change(changeset, [], %{})}
+    end
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:mnesia_after_transaction_called, result.id})
+        {:ok, result}
+      end)
+    end
+  end
+
   defmodule MnesiaPost do
     @doc false
 
@@ -569,6 +592,10 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
     actions do
       default_accept :*
       defaults [:read, :destroy, :create, :update]
+
+      destroy :destroy_with_after_transaction do
+        change MnesiaAfterTransactionChange
+      end
     end
   end
 
@@ -1955,6 +1982,49 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
       titles = Enum.map(result.records, & &1.title)
       assert "valid_title" in titles
       assert "fail_this_one" in titles
+    end
+  end
+
+  describe "after_transaction hooks run outside batch transaction" do
+    test "after_transaction hooks run outside batch transaction - no warning" do
+      # Create some posts first
+      Ash.bulk_create!(
+        [%{title: "test1"}, %{title: "test2"}],
+        MnesiaPost,
+        :create,
+        return_records?: true,
+        authorize?: false
+      )
+
+      posts = Ash.read!(MnesiaPost)
+      assert length(posts) == 2
+
+      # With transaction: :batch, after_transaction hooks now run OUTSIDE the transaction
+      # so no warning should be logged
+      log =
+        capture_log(fn ->
+          result =
+            Ash.bulk_destroy(
+              posts,
+              :destroy_with_after_transaction,
+              %{},
+              resource: MnesiaPost,
+              return_records?: true,
+              authorize?: false,
+              strategy: [:stream]
+              # transaction: :batch is the default
+            )
+
+          assert result.status == :success
+          assert length(result.records) == 2
+        end)
+
+      # Verify the hooks executed
+      assert_receive {:mnesia_after_transaction_called, _id1}, 1000
+      assert_receive {:mnesia_after_transaction_called, _id2}, 1000
+
+      # Should NOT warn since after_transaction now runs outside the transaction
+      refute log =~ "after_transaction"
     end
   end
 end

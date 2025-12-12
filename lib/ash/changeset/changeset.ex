@@ -4325,10 +4325,19 @@ defmodule Ash.Changeset do
   defp warn_on_transaction_hooks(_, [], _), do: :ok
 
   defp warn_on_transaction_hooks(changeset, _, type) do
+    has_relevant_hooks? =
+      case type do
+        "after_transaction" ->
+          changeset.after_transaction != []
+
+        _ ->
+          changeset.before_transaction != [] or changeset.around_transaction != []
+      end
+
     if Application.get_env(:ash, :warn_on_transaction_hooks?) != false &&
          changeset.context[:warn_on_transaction_hooks?] != false &&
          Ash.DataLayer.in_transaction?(changeset.resource) &&
-         (changeset.before_transaction != [] or changeset.around_transaction != []) do
+         has_relevant_hooks? do
       message =
         if type in ["before_transaction", "around_transaction"] do
           "already"

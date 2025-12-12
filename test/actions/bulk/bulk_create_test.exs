@@ -163,9 +163,13 @@ defmodule Ash.Test.Actions.BulkCreateTest do
     """
     use Ash.Resource.Change
 
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+
     def change(changeset, _opts, _context) do
       changeset
-      |> Ash.Changeset.after_action(fn changeset, result ->
+      |> Ash.Changeset.after_action(fn _changeset, result ->
         # Fail if title starts with "fail_"
         if String.starts_with?(result.title || "", "fail_") do
           {:error,

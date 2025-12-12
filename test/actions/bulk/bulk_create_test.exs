@@ -521,6 +521,25 @@ defmodule Ash.Test.Actions.BulkCreateTest do
     end
   end
 
+  defmodule MnesiaAfterTransactionChange do
+    @moduledoc """
+    Change module that adds after_transaction hook for Mnesia resource.
+    Used to test warning when after_transaction runs inside a transaction.
+    """
+    use Ash.Resource.Change
+
+    def atomic(changeset, _opts, _context) do
+      {:ok, change(changeset, [], %{})}
+    end
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:mnesia_after_transaction_called, result.id})
+        {:ok, result}
+      end)
+    end
+  end
+
   defmodule MnesiaPost do
     @moduledoc false
     use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Mnesia
@@ -550,6 +569,10 @@ defmodule Ash.Test.Actions.BulkCreateTest do
                  send(self(), {:after_transaction_called, result})
                  result
                end)
+      end
+
+      create :create_with_after_transaction do
+        change MnesiaAfterTransactionChange
       end
     end
   end
@@ -2446,6 +2469,33 @@ defmodule Ash.Test.Actions.BulkCreateTest do
 
       # No records should exist because the transaction was rolled back
       assert [] == MnesiaPost |> Ash.read!()
+    end
+
+    test "after_transaction hooks run outside batch transaction - no warning" do
+      # With transaction: :batch, after_transaction hooks now run OUTSIDE the transaction
+      # so no warning should be logged
+      log =
+        capture_log(fn ->
+          result =
+            Ash.bulk_create(
+              [%{title: "test1"}, %{title: "test2"}],
+              MnesiaPost,
+              :create_with_after_transaction,
+              return_records?: true,
+              authorize?: false
+              # transaction: :batch is the default
+            )
+
+          assert result.status == :success
+          assert length(result.records) == 2
+        end)
+
+      # Verify the hooks executed
+      assert_receive {:mnesia_after_transaction_called, _id1}, 1000
+      assert_receive {:mnesia_after_transaction_called, _id2}, 1000
+
+      # Should NOT warn since after_transaction now runs outside the transaction
+      refute log =~ "after_transaction"
     end
   end
 end

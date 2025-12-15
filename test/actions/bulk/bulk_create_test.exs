@@ -411,6 +411,28 @@ defmodule Ash.Test.Actions.BulkCreateTest do
                end)
       end
 
+      create :create_with_after_transaction_converts_error_with_author do
+        argument :author_id, :uuid
+
+        change after_transaction(fn
+                 _changeset, {:ok, result}, _context ->
+                   {:ok, result}
+
+                 changeset, {:error, _original_error}, _context ->
+                   send(self(), {:after_transaction_converted_error_with_author})
+                   # Return a "fake" success with a default record including author_id
+                   author_id = Ash.Changeset.get_argument(changeset, :author_id)
+
+                   {:ok,
+                    %{
+                      changeset.data
+                      | id: Ash.UUID.generate(),
+                        title: "default_from_hook",
+                        author_id: author_id
+                    }}
+               end)
+      end
+
       create :create_with_after_transaction_modifies_error do
         change after_transaction(fn
                  _changeset, {:ok, result}, _context ->
@@ -1833,6 +1855,58 @@ defmodule Ash.Test.Actions.BulkCreateTest do
       titles = Enum.map(result.records, & &1.title)
       assert "valid_title" in titles
       assert "recovered_from_after_action_failure" in titles
+    end
+
+    test "load option is applied to records from after_transaction converting error to success" do
+      # This test exposes a bug where records returned from after_transaction hooks
+      # that convert errors to success don't get the load option applied.
+      # The issue is that these records are added to must_be_simple_results which
+      # is concatenated AFTER process_results, but the loading happens INSIDE
+      # process_results.
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create an author to reference
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create with invalid data (title is nil, but required)
+      # The after_transaction hook should convert the error to success
+      # and return a record with the author_id set
+      result =
+        Ash.bulk_create(
+          [%{title: nil, author_id: author.id}],
+          Post,
+          :create_with_after_transaction_converts_error_with_author,
+          tenant: org.id,
+          return_records?: true,
+          return_errors?: true,
+          authorize?: false,
+          load: [:author]
+        )
+
+      # The hook should have been called
+      assert_receive {:after_transaction_converted_error_with_author}, 1000
+
+      # The result should show success
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 1
+
+      [record] = result.records
+
+      # The record should have the author_id set
+      assert record.author_id == author.id
+
+      # BUG: The author relationship should be loaded because we passed load: [:author]
+      # but currently it's not because the record from after_transaction hooks
+      # doesn't go through the loading logic in process_results
+      assert %Author{} = record.author,
+             "Expected author to be loaded, but got: #{inspect(record.author)}"
     end
   end
 

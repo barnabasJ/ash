@@ -1902,11 +1902,48 @@ defmodule Ash.Test.Actions.BulkCreateTest do
       # The record should have the author_id set
       assert record.author_id == author.id
 
-      # BUG: The author relationship should be loaded because we passed load: [:author]
-      # but currently it's not because the record from after_transaction hooks
-      # doesn't go through the loading logic in process_results
+      # The author relationship should be loaded because we passed load: [:author]
       assert %Author{} = record.author,
              "Expected author to be loaded, but got: #{inspect(record.author)}"
+    end
+
+    test "sorted? option works with after_transaction converting error to success" do
+      # This test verifies that when after_transaction hooks convert errors to success,
+      # the resulting records are properly sorted by their original index when sorted?: true
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create with a mix: valid at index 0, invalid at index 1, valid at index 2
+      # The invalid one will be converted to success by after_transaction
+      result =
+        Ash.bulk_create(
+          [
+            %{title: "first_valid"},
+            %{title: nil},
+            %{title: "third_valid"}
+          ],
+          Post,
+          :create_with_after_transaction_converts_error_to_success,
+          tenant: org.id,
+          return_records?: true,
+          return_errors?: true,
+          authorize?: false,
+          sorted?: true
+        )
+
+      # The hook should have been called for the invalid changeset
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # All three should succeed
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 3
+
+      # With sorted?: true, records should be in original input order
+      titles = Enum.map(result.records, & &1.title)
+      assert titles == ["first_valid", "default_from_hook", "third_valid"]
     end
   end
 

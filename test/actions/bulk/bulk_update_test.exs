@@ -3129,5 +3129,101 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
       assert "valid_title" in titles
       assert "recovered_from_after_action_failure" in titles
     end
+
+    test "load option is applied to records from after_transaction converting error to success" do
+      # This test verifies that records returned from after_transaction hooks
+      # that convert errors to success get the load option applied.
+      # Create an author
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create a post with the author
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test", author_id: author.id})
+        |> Ash.create!()
+
+      # Update with invalid data (title is nil, but required)
+      # The after_transaction hook should convert the error to success
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(
+          :update_with_after_transaction_converts_error_to_success,
+          %{title: nil},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true,
+          load: [:author]
+        )
+
+      # The hook should have been called
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # The result should show success
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 1
+
+      [record] = result.records
+
+      # The record should have the author_id set
+      assert record.author_id == author.id
+
+      # The author relationship should be loaded because we passed load: [:author]
+      assert %Author{} = record.author,
+             "Expected author to be loaded, but got: #{inspect(record.author)}"
+    end
+
+    test "sorted? option works with after_transaction converting error to success" do
+      # This test verifies that when after_transaction hooks convert errors to success,
+      # the resulting records are properly sorted by their original index when sorted?: true
+
+      # Create posts with different titles to ensure specific ordering
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "aaa_first"})
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "bbb_second"})
+        |> Ash.create!()
+
+      post3 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "ccc_third"})
+        |> Ash.create!()
+
+      # Update with invalid data - all will fail validation and be converted to success
+      result =
+        Post
+        |> Ash.Query.filter(id in [^post1.id, ^post2.id, ^post3.id])
+        |> Ash.Query.sort(:title)
+        |> Ash.bulk_update(
+          :update_with_after_transaction_converts_error_to_success,
+          %{title: nil},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true,
+          sorted?: true
+        )
+
+      # Hooks should have been called
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # All three should succeed
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 3
+
+      # With sorted?: true, records should be in original query order (sorted by title)
+      titles = Enum.map(result.records, & &1.title)
+      assert titles == ["aaa_first", "bbb_second", "ccc_third"]
+    end
   end
 end

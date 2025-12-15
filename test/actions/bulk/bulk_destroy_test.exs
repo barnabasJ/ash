@@ -1836,6 +1836,103 @@ defmodule Ash.Test.Actions.BulkDestroyTest do
       assert length(result.records) == 1
     end
 
+    test "load option is applied to records from after_transaction converting error to success" do
+      # This test verifies that records returned from after_transaction hooks
+      # that convert errors to success get the load option applied.
+      # Create an author
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create a post with the author
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test", author_id: author.id})
+        |> Ash.create!()
+
+      # Destroy with a validation that always fails
+      # The after_transaction hook should convert the error to success
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_transaction_converts_error_to_success,
+          %{},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true,
+          load: [:author]
+        )
+
+      # The hook should have been called
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # The result should show success
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 1
+
+      [record] = result.records
+
+      # The record should have the author_id set
+      assert record.author_id == author.id
+
+      # The author relationship should be loaded because we passed load: [:author]
+      assert %Author{} = record.author,
+             "Expected author to be loaded, but got: #{inspect(record.author)}"
+    end
+
+    test "sorted? option works with after_transaction converting error to success" do
+      # This test verifies that when after_transaction hooks convert errors to success,
+      # the resulting records are properly sorted by their original index when sorted?: true
+
+      # Create multiple posts (will all fail validation but be converted to success)
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "post_1"})
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "post_2"})
+        |> Ash.create!()
+
+      post3 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "post_3"})
+        |> Ash.create!()
+
+      # Destroy all posts - they'll all fail validation but the hook converts errors to success
+      # The sorted?: true option should ensure results come back in query order
+      result =
+        Post
+        |> Ash.Query.filter(id in [^post1.id, ^post2.id, ^post3.id])
+        |> Ash.Query.sort(:title)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_transaction_converts_error_to_success,
+          %{},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true,
+          sorted?: true
+        )
+
+      # The hooks should have been called for all records
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # All records should be returned
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 3
+
+      # Records should be in sorted order (by title)
+      titles = Enum.map(result.records, & &1.title)
+      assert titles == ["post_1", "post_2", "post_3"]
+    end
+
     test "hook can modify validation error" do
       post =
         Post

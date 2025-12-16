@@ -576,11 +576,25 @@ defmodule Ash.Actions.Create.Bulk do
 
     # Separate valid and invalid changesets
     # Invalid changesets will be passed to process_results as error tuples
-    # so after_transaction hooks run there and loading is applied
+    # so after_transaction hooks run there and loading is applied.
+    #
+    # Exception: if stop_on_error? is true AND the changeset has NO after_transaction
+    # hooks, we call store_error immediately (which throws) to stop processing.
+    # If after_transaction hooks exist, we defer to process_results so those hooks
+    # can potentially convert the error to success.
     {batch, invalid_changeset_errors} =
       Enum.reduce(batch, {[], []}, fn
         %{valid?: false} = changeset, {batch_acc, errors_acc} ->
           error = Ash.Error.to_error_class(changeset.errors, changeset: changeset)
+
+          # If stop_on_error? is set AND there are no after_transaction hooks,
+          # call store_error immediately. This will throw and stop processing.
+          # If after_transaction hooks exist, defer to process_results so they can run.
+          if opts[:stop_on_error?] && !opts[:return_stream?] &&
+               changeset.after_transaction in [[], nil] do
+            store_error(ref, error, opts)
+          end
+
           {batch_acc, [{:error, error, changeset} | errors_acc]}
 
         changeset, {batch_acc, errors_acc} ->

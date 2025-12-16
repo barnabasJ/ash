@@ -363,6 +363,20 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
       destroy :destroy_with_after_transaction do
         change MnesiaAfterTransactionChange
       end
+
+      destroy :destroy_with_after_action_error_and_after_transaction do
+        # after_action returns error, triggering rollback
+        change after_action(fn _changeset, _result, _context ->
+                 send(self(), {:after_action_error_hook_called})
+                 {:error, "after_action hook error"}
+               end)
+
+        # after_transaction should still be called after the rollback
+        change after_transaction(fn _changeset, result, _context ->
+                 send(self(), {:after_transaction_called, result})
+                 result
+               end)
+      end
     end
   end
 
@@ -854,6 +868,120 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
       assert length(result.errors) == 1
       assert length(result.records) == 2
     end
+
+    test "with explicit return_errors?: true returns errors list" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      # This action's hook returns an error even on success
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(
+          :destroy_with_atomic_after_transaction_returns_error,
+          %{},
+          strategy: :atomic,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # Hook executed and returned error
+      assert_receive {:after_transaction_hook_returning_error, _id1}, 1000
+
+      # Error should be captured
+      assert result.status == :error
+      assert result.error_count == 1
+      assert length(result.errors) == 1
+    end
+
+    test "with both return_records?: true and return_errors?: true" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+      assert result.errors == []
+
+      # Verify hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+
+    test "hooks execute with :atomic strategy even without return_records?" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      post_id = post.id
+
+      # Call without return_records? - with atomic strategy, hooks still execute
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post_id)
+        |> Ash.bulk_destroy(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic
+        )
+
+      assert result.status == :success
+
+      # With :atomic strategy, hooks execute even without return_records?: true
+      assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+
+      # Record is still destroyed
+      assert [] = Ash.read!(Post)
+    end
+
+    test "after_transaction hooks work with :stream strategy on success" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Stream strategy success test (not just with return_stream?)
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :stream,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
   end
 
   describe "after_transaction hook return value for invalid changesets" do
@@ -1048,6 +1176,39 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
       assert length(result.records) == 2
     end
 
+    test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets (unsorted)" do
+      # Same test without sorted? to expose deeper issues with hook_success_results
+      valid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "valid_title"})
+        |> Ash.create!()
+
+      invalid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "will_be_invalid"})
+        |> Ash.create!()
+
+      result =
+        Post
+        |> Ash.Query.filter(id in [^valid_post.id, ^invalid_post.id])
+        |> Ash.bulk_destroy(
+          :destroy_with_after_transaction_converts_error_to_success,
+          %{},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The hook should have been called for the invalid changeset(s)
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # Both records should be returned - converted to success by the hook
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+    end
+
     test "after_action failure converted to success in run_after_action_hooks with mixed valid/invalid" do
       # This test exposes the bug where hook_success_results from after_action failures
       # that are converted to success by after_transaction hooks are not properly handled.
@@ -1125,7 +1286,52 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
         Ash.DataLayer.Mnesia.start(Domain, [MnesiaPost])
       end)
 
+      # Clean up any existing records to ensure test isolation
+      MnesiaPost
+      |> Ash.read!()
+      |> Enum.each(fn record -> Ash.destroy!(record) end)
+
       :ok
+    end
+
+    test "after_action error with rollback_on_error? triggers rollback and after_transaction is NOT called" do
+      # Create records first
+      posts =
+        for i <- 1..2 do
+          MnesiaPost
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        MnesiaPost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_action_error_and_after_transaction,
+          %{},
+          strategy: :stream,
+          transaction: :all,
+          rollback_on_error?: true,
+          return_errors?: true
+        )
+
+      # The after_action hook should have been called (it triggers the rollback)
+      assert_receive {:after_action_error_hook_called}
+
+      # The transaction was rolled back, returns a BulkResult
+      assert %Ash.BulkResult{errors: errors} = result
+      assert length(errors) > 0
+      [error | _] = errors
+      assert %Ash.Error.Unknown.UnknownError{error: "\"after_action hook error\""} = error
+
+      # after_transaction hook is NOT called because we don't have access to
+      # the changesets after a transaction rollback
+      refute_receive {:after_transaction_called, _}
+
+      # Records should still exist (transaction rolled back)
+      assert length(MnesiaPost |> Ash.read!()) == 2
     end
 
     test "after_transaction hooks run outside batch transaction - no warning" do
@@ -1163,6 +1369,104 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
 
       # Should NOT warn since after_transaction now runs outside the transaction
       refute log =~ "after_transaction"
+    end
+  end
+
+  describe "after_transaction with notification options" do
+    test "after_transaction hooks work with return_notifications?: true and :stream strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(:destroy_with_atomic_after_transaction, %{},
+          strategy: :stream,
+          return_records?: true,
+          return_notifications?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+      assert result.notifications != nil
+
+      # Verify after_transaction hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks work with notify?: true and :stream strategy" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(:destroy_with_atomic_after_transaction, %{},
+          strategy: :stream,
+          return_records?: true,
+          notify?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Notifications should be sent (via Notifier module)
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+
+      # Verify after_transaction hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks work with notify?: true and :atomic_batches strategy" do
+      posts =
+        for i <- 1..4 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "post #{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use list of records with atomic_batches strategy
+      result =
+        posts
+        |> Ash.bulk_destroy!(:destroy_with_atomic_after_transaction, %{},
+          strategy: :atomic_batches,
+          batch_size: 2,
+          return_records?: true,
+          notify?: true
+        )
+
+      assert result.status == :success
+
+      # Notifications should be sent
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+
+      # Verify after_transaction hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
     end
   end
 end

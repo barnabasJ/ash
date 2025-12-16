@@ -402,6 +402,62 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
     end
   end
 
+  defmodule MnesiaAfterTransactionChange do
+    @moduledoc """
+    Change module that adds after_transaction hook for Mnesia resource.
+    Used to test warning when after_transaction runs inside a transaction.
+    """
+    use Ash.Resource.Change
+
+    def atomic(changeset, _opts, _context) do
+      {:ok, change(changeset, [], %{})}
+    end
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:mnesia_after_transaction_called, result.id})
+        {:ok, result}
+      end)
+    end
+  end
+
+  defmodule MnesiaPost do
+    @moduledoc false
+    use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Mnesia, notifiers: [Notifier]
+
+    mnesia do
+      table :mnesia_post_after_transaction_updates
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string, allow_nil?: false, public?: true
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, :destroy, :create, :update]
+
+      update :update_with_after_action_error_and_after_transaction do
+        # after_action returns error, triggering rollback
+        change after_action(fn _changeset, _result, _context ->
+                 send(self(), {:after_action_error_hook_called})
+                 {:error, "after_action hook error"}
+               end)
+
+        # after_transaction should still be called after the rollback
+        change after_transaction(fn _changeset, result, _context ->
+                 send(self(), {:after_transaction_called, result})
+                 result
+               end)
+      end
+
+      update :update_with_after_transaction do
+        change MnesiaAfterTransactionChange
+      end
+    end
+  end
+
   describe "atomic changes with after_transaction hooks" do
     test "after_transaction hooks execute in atomic strategy" do
       post =
@@ -1343,6 +1399,39 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
       assert length(result.records) == 2
     end
 
+    test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets (unsorted)" do
+      # Same test without sorted? to expose deeper issues with hook_success_results
+      valid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "valid_title"})
+        |> Ash.create!()
+
+      invalid_post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "will_be_invalid"})
+        |> Ash.create!()
+
+      result =
+        Post
+        |> Ash.Query.filter(id in [^valid_post.id, ^invalid_post.id])
+        |> Ash.bulk_update(
+          :update_with_after_transaction_converts_error_to_success,
+          %{title: nil},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The hook should have been called for the invalid changeset(s)
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # Both records should be returned - converted to success by the hook
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+    end
+
     test "after_action failure converted to success in run_after_action_hooks with mixed valid/invalid" do
       # This test exposes the bug where hook_success_results from after_action failures
       # that are converted to success by after_transaction hooks are not properly handled.
@@ -1517,6 +1606,99 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
       # With sorted?: true, records should be in original query order (sorted by title)
       titles = Enum.map(result.records, & &1.title)
       assert titles == ["aaa_first", "bbb_second", "ccc_third"]
+    end
+  end
+
+  describe "after_transaction hooks run outside batch transaction" do
+    import ExUnit.CaptureLog
+
+    setup do
+      capture_log(fn ->
+        Ash.DataLayer.Mnesia.start(Domain, [MnesiaPost])
+      end)
+
+      # Clean up any existing records to ensure test isolation
+      MnesiaPost
+      |> Ash.read!()
+      |> Enum.each(fn record -> Ash.destroy!(record) end)
+
+      :ok
+    end
+
+    test "after_action error with rollback_on_error? triggers rollback and after_transaction is NOT called" do
+      # Create records first
+      post1 =
+        MnesiaPost
+        |> Ash.Changeset.for_create(:create, %{title: "title1"})
+        |> Ash.create!()
+
+      post2 =
+        MnesiaPost
+        |> Ash.Changeset.for_create(:create, %{title: "title2"})
+        |> Ash.create!()
+
+      result =
+        MnesiaPost
+        |> Ash.Query.filter(id in [^post1.id, ^post2.id])
+        |> Ash.bulk_update(
+          :update_with_after_action_error_and_after_transaction,
+          %{},
+          strategy: :stream,
+          transaction: :all,
+          rollback_on_error?: true,
+          return_errors?: true
+        )
+
+      # The after_action hook should have been called (it triggers the rollback)
+      assert_receive {:after_action_error_hook_called}
+
+      # The transaction was rolled back, returns a BulkResult
+      # Note: With stream strategy and rollback, the status may be :success but errors are captured
+      assert %Ash.BulkResult{errors: errors} = result
+      assert length(errors) > 0
+      [error | _] = errors
+      assert %Ash.Error.Unknown.UnknownError{error: "\"after_action hook error\""} = error
+
+      # after_transaction hook is NOT called because we don't have access to
+      # the changesets after a transaction rollback
+      refute_receive {:after_transaction_called, _}
+
+      # Records should still exist (transaction rolled back, original data preserved)
+      assert length(MnesiaPost |> Ash.read!()) == 2
+    end
+
+    test "after_transaction hooks run outside batch transaction - no warning" do
+      # Create a record first
+      post =
+        MnesiaPost
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      # With transaction: :batch, after_transaction hooks now run OUTSIDE the transaction
+      # so no warning should be logged
+      log =
+        capture_log(fn ->
+          result =
+            MnesiaPost
+            |> Ash.Query.filter(id == ^post.id)
+            |> Ash.bulk_update(
+              :update_with_after_transaction,
+              %{title: "updated"},
+              strategy: :stream,
+              return_records?: true,
+              authorize?: false
+              # transaction: :batch is the default
+            )
+
+          assert result.status == :success
+          assert length(result.records) == 1
+        end)
+
+      # Verify the hook executed
+      assert_receive {:mnesia_after_transaction_called, _id}, 1000
+
+      # Should NOT warn since after_transaction now runs outside the transaction
+      refute log =~ "after_transaction"
     end
   end
 end

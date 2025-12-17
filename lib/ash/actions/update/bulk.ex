@@ -1958,49 +1958,36 @@ defmodule Ash.Actions.Update.Bulk do
         end
       )
 
-    # TODO: do this for the other actions as well
-    {batch, simple_results} =
+    # Separate valid and invalid changesets
+    # Run after_transaction hooks immediately for invalid changesets to determine
+    # if they convert errors to success. This allows stop_on_error? to work correctly
+    # while still honoring hooks that convert errors.
+    # Results are tagged with :ok_hooks_done or :error_hooks_done so process_results
+    # knows not to run after_transaction hooks again.
+    {batch, invalid_changeset_results} =
       Enum.reduce(batch, {[], []}, fn
-        %{valid?: false} = changeset, {batch, simple_results} ->
-          # Run after_transaction hooks for failed changesets
-          if changeset.after_transaction != [] do
-            Ash.Changeset.run_after_transactions(
-              {:error, Ash.Error.to_error_class(changeset.errors, changeset: changeset)},
-              changeset
-            )
-            |> case do
-              {:ok, result} ->
-                Process.put({:any_success?, ref}, true)
+        %{valid?: false} = changeset, {batch_acc, results_acc} ->
+          error = Ash.Error.to_error_class(changeset.errors, changeset: changeset)
 
-                {
-                  batch,
-                  [
-                    Ash.Resource.set_metadata(result, %{
-                      metadata_key =>
-                        changeset.context |> Map.get(context_key) |> Map.get(:index),
-                      ref_metadata_key =>
-                        changeset.context |> Map.get(context_key) |> Map.get(:ref)
-                    })
-                    | simple_results
-                  ]
-                }
+          case Ash.Changeset.run_after_transactions({:error, error}, changeset) do
+            {:ok, result} ->
+              # Hook converted error to success
+              {batch_acc, [{:ok_hooks_done, result, changeset} | results_acc]}
 
-              {:error, hook_error} ->
-                store_error(ref, hook_error, opts)
+            {:error, error} ->
+              if opts[:stop_on_error?] && !opts[:return_stream?] do
+                throw({:error, Ash.Error.to_error_class(error), 0})
+              end
 
-                {batch, simple_results}
-            end
-          else
-            store_error(ref, changeset, opts)
-            {batch, simple_results}
+              {batch_acc, [{:error_hooks_done, error, changeset} | results_acc]}
           end
 
-        changeset, {batch, simple_results} ->
-          {[changeset | batch], simple_results}
+        changeset, {batch_acc, results_acc} ->
+          {[changeset | batch_acc], results_acc}
       end)
 
     batch = Enum.reverse(batch)
-    must_be_simple_results = must_be_simple_results ++ Enum.reverse(simple_results)
+    invalid_changeset_results = Enum.reverse(invalid_changeset_results)
 
     if opts[:transaction] == :batch &&
          Ash.DataLayer.data_layer_can?(resource, :transact) do
@@ -2045,8 +2032,11 @@ defmodule Ash.Actions.Update.Bulk do
         |> case do
           {:ok, {tagged_results, batch, changesets_by_ref, changesets_by_index}} ->
             # process_results runs OUTSIDE transaction - after_transaction hooks run here
+            # Include invalid_changeset_results so they go through the loading logic
+            all_tagged_results = invalid_changeset_results ++ tagged_results
+
             process_results(
-              tagged_results,
+              all_tagged_results,
               opts,
               ref,
               batch,
@@ -2107,8 +2097,11 @@ defmodule Ash.Actions.Update.Bulk do
           action_select
         )
 
+      # Include invalid_changeset_results so they go through the loading logic
+      all_tagged_results = invalid_changeset_results ++ tagged_results
+
       process_results(
-        tagged_results,
+        all_tagged_results,
         opts,
         ref,
         batch,
@@ -3028,6 +3021,8 @@ defmodule Ash.Actions.Update.Bulk do
          base_changeset
        ) do
     # tagged_results is now list of {:ok, result, changeset} | {:error, error, changeset}
+    # Also handles {:ok_hooks_done, result, changeset} | {:error_hooks_done, error, changeset}
+    # where after_transaction hooks have already been run
     # run_bulk_after_changes has already been called in do_handle_batch (inside transaction)
     results =
       Enum.flat_map(tagged_results, fn
@@ -3089,6 +3084,29 @@ defmodule Ash.Actions.Update.Bulk do
               store_error(ref, e, opts)
               []
           end
+
+        {:ok_hooks_done, result, changeset} ->
+          # after_transaction hooks already ran and converted error to success
+          Process.put({:any_success?, ref}, true)
+
+          if opts[:notify?] || opts[:return_notifications?] do
+            store_notification(ref, notification(changeset, result, opts), opts)
+          end
+
+          if opts[:return_records?] do
+            [
+              Ash.Resource.set_metadata(result, %{
+                metadata_key => changeset.context[context_key].index
+              })
+            ]
+          else
+            []
+          end
+
+        {:error_hooks_done, error, _changeset} ->
+          # after_transaction hooks already ran and returned error
+          store_error(ref, error, opts)
+          []
       end)
 
     results

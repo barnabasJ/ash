@@ -216,6 +216,54 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
     end
   end
 
+  defmodule AfterTransactionRaisesException do
+    @moduledoc """
+    Change module where after_transaction hook raises an exception.
+    Used to test that exceptions in hooks are caught and converted to errors.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:before_exception_raise, result.id})
+        raise "Hook intentionally raised exception"
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
+  defmodule AfterTransactionWithStopOnError do
+    @moduledoc """
+    Change module where after_transaction hook returns an error for specific records.
+    Used to test stop_on_error? behavior with hook errors.
+    Records with title containing "stop_here" will cause the hook to return an error.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          if String.contains?(result.title, "stop_here") do
+            send(self(), {:hook_error_for_stop_on_error, result.id})
+            {:error, "Hook error to trigger stop"}
+          else
+            send(self(), {:hook_success_for_stop_on_error, result.id})
+            {:ok, result}
+          end
+
+        _changeset, {:error, error} ->
+          {:error, error}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
   defmodule MnesiaAfterTransactionChange do
     @moduledoc """
     Change module that adds after_transaction hook for Mnesia resource.
@@ -328,6 +376,14 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
 
       destroy :destroy_with_after_action_failure_converted_to_success do
         change AfterActionFailsWithAfterTransaction
+      end
+
+      destroy :destroy_with_after_transaction_raises_exception do
+        change AfterTransactionRaisesException
+      end
+
+      destroy :destroy_with_stop_on_error_hook do
+        change AfterTransactionWithStopOnError
       end
     end
 
@@ -1467,6 +1523,933 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
       for post_id <- post_ids do
         assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
       end
+    end
+  end
+
+  describe "after_transaction exception handling" do
+    test "exception in hook is caught and converted to error" do
+      # Create a record
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      post_id = post.id
+
+      # Use the action with hook that raises exception
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post_id)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_transaction_raises_exception,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          authorize?: false
+        )
+
+      # Hook should have sent message before raising
+      assert_receive {:before_exception_raise, ^post_id}
+
+      # Exception should be caught and converted to error
+      assert result.status == :error
+      assert length(result.errors) == 1
+      [error] = result.errors
+      assert Exception.message(error) =~ "Hook intentionally raised exception"
+    end
+
+    test "hook raising exception doesn't crash bulk operation with multiple records" do
+      # Create multiple records
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "test_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use the action with hook that raises exception - with stop_on_error?: false
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_transaction_raises_exception,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          stop_on_error?: false,
+          authorize?: false
+        )
+
+      # All hooks should have sent messages before raising
+      assert_receive {:before_exception_raise, _id1}
+      assert_receive {:before_exception_raise, _id2}
+      assert_receive {:before_exception_raise, _id3}
+
+      # All exceptions should be caught and converted to errors
+      assert result.status == :error
+      assert length(result.errors) == 3
+    end
+  end
+
+  describe "after_transaction with stop_on_error? (default: true)" do
+    test "hook returns error without return_stream? - error captured in result" do
+      # Create a record
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "stop_here"})
+        |> Ash.create!()
+
+      post_id = post.id
+
+      # Use the action with hook that returns error for "stop_here" titles
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post_id)
+        |> Ash.bulk_destroy(
+          :destroy_with_stop_on_error_hook,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          authorize?: false
+        )
+
+      # Hook should have executed and returned error
+      assert_receive {:hook_error_for_stop_on_error, ^post_id}
+
+      # Error should be captured
+      assert result.status == :error
+      assert length(result.errors) == 1
+    end
+
+    test "hook returns error stops processing with default stop_on_error?: true" do
+      # Create multiple records - one that will fail, one that won't
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "stop_here_first"})
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "normal_second"})
+        |> Ash.create!()
+
+      # Query both posts, stop_here will be processed first and cause stop
+      result =
+        Post
+        |> Ash.Query.filter(id in ^[post1.id, post2.id])
+        |> Ash.Query.sort(:title)
+        |> Ash.bulk_destroy(
+          :destroy_with_stop_on_error_hook,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          authorize?: false
+          # stop_on_error?: true is the default in test config
+        )
+
+      # With stop_on_error?: true (test default), the error is captured
+      assert result.status == :error
+
+      # The first record should have triggered the error
+      assert_receive {:hook_error_for_stop_on_error, _}
+    end
+
+    test "stop_on_error?: false continues after hook error" do
+      # Create multiple records - some will fail, some will succeed
+      posts =
+        for title <- ["stop_here_1", "normal_1", "stop_here_2", "normal_2"] do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: title})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Explicitly disable stop_on_error
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy(
+          :destroy_with_stop_on_error_hook,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          stop_on_error?: false,
+          authorize?: false
+        )
+
+      # With stop_on_error?: false, all records should be processed
+      # 2 should succeed ("normal_*") and 2 should fail ("stop_here_*")
+      assert_receive {:hook_success_for_stop_on_error, _}
+      assert_receive {:hook_success_for_stop_on_error, _}
+      assert_receive {:hook_error_for_stop_on_error, _}
+      assert_receive {:hook_error_for_stop_on_error, _}
+
+      # partial_success because some succeeded and some failed
+      assert result.status == :partial_success
+      # Should have 2 successes and 2 errors
+      assert length(result.records) == 2
+      assert length(result.errors) == 2
+    end
+  end
+
+  describe "after_transaction with :atomic strategy and notifications" do
+    test "after_transaction hooks work with return_notifications?: true" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "notify_test_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic,
+          return_records?: true,
+          return_notifications?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Notifications should be returned
+      assert length(result.notifications) == 3
+
+      # after_transaction hooks should still execute
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+
+    test "after_transaction hooks work with notify?: true" do
+      posts =
+        for i <- 1..2 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "notify_immediate_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic,
+          return_records?: true,
+          notify?: true
+        )
+
+      assert result.status == :success
+
+      # Notifications should be sent immediately
+      assert_received {:notification, _}
+      assert_received {:notification, _}
+
+      # after_transaction hooks should execute
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+  end
+
+  describe "after_transaction with invalid atomic changeset" do
+    test "invalid atomic changeset with after_transaction hooks" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "invalid_atomic"})
+        |> Ash.create!()
+
+      # Use the action with AlwaysFailsValidation - should fail atomically
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(
+          :destroy_with_atomic_after_transaction_always_fails,
+          %{},
+          strategy: :atomic,
+          return_errors?: true,
+          return_records?: true
+        )
+
+      assert result.status == :error
+      assert length(result.errors) == 1
+
+      # after_transaction hook should be called with the error
+      assert_receive {:after_transaction_destroy_error, _error}, 1000
+
+      # The post should still exist (not destroyed)
+      assert Ash.get!(Post, post.id)
+    end
+
+    test "atomic operation fails entirely - hook converts error to success" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "convert_error"})
+        |> Ash.create!()
+
+      # Use the action that converts errors to success in after_transaction
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_transaction_converts_error_to_success,
+          %{},
+          strategy: :atomic,
+          return_errors?: true,
+          return_records?: true
+        )
+
+      # Hook converts error to success
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # The operation should have a success status because the hook converted it
+      assert result.status == :success
+      assert length(result.records) == 1
+    end
+  end
+
+  describe "after_transaction with manual action path (non-atomic)" do
+    test "stream strategy forces manual action path with after_transaction hooks" do
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "manual_stream_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Stream strategy forces the manual action path
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_with_after_transaction,
+          %{},
+          strategy: :stream,
+          return_records?: true,
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Verify all records were destroyed
+      remaining = Post |> Ash.Query.filter(id in ^post_ids) |> Ash.read!()
+      assert remaining == []
+    end
+
+    test "manual action path with after_transaction hooks modifying result" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "manual_modify"})
+        |> Ash.create!()
+
+      # Use stream strategy which forces manual action path
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy!(
+          :destroy_with_after_transaction,
+          %{},
+          strategy: :stream,
+          return_records?: true,
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+      [destroyed_record] = result.records
+
+      # The after_transaction hook appends "_stuff" to the title
+      assert destroyed_record.title == "manual_modify_stuff"
+    end
+
+    test "manual action path with after_action failure converted to success by after_transaction" do
+      # Create posts - one that will fail in after_action
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "fail_in_after_action"})
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "succeed_normal"})
+        |> Ash.create!()
+
+      post_ids = [post1.id, post2.id]
+
+      # Use the action where after_action fails for "fail_" prefix
+      # but after_transaction converts the error to success
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy(
+          :destroy_with_after_action_failure_converted_to_success,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          stop_on_error?: false,
+          authorize?: false
+        )
+
+      # After_action failed but after_transaction converted it to success
+      assert_receive {:after_action_failed_converted_to_success}, 1000
+
+      # Status should be success because after_transaction recovered
+      assert result.status == :success
+    end
+
+    test "strategy fallback: [:atomic, :stream] with after_transaction hooks" do
+      posts =
+        for i <- 1..2 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "fallback_destroy_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Strategy list - will try atomic, may fall back to stream
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: [:atomic, :stream],
+          return_records?: true,
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 2
+
+      # Hooks should work regardless of strategy used
+      assert_receive {:after_transaction_destroy_called, _id1}, 1000
+      assert_receive {:after_transaction_destroy_called, _id2}, 1000
+    end
+  end
+
+  describe "after_transaction with load option" do
+    test "load option with :atomic strategy and after_transaction hooks" do
+      # Create an author
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create a post with the author
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "load_atomic_test", author_id: author.id})
+        |> Ash.create!()
+
+      # Use atomic strategy with load option and after_transaction hooks
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+      [destroyed_record] = result.records
+
+      # Verify load worked
+      assert %Author{name: "Test Author"} = destroyed_record.author
+
+      # Verify after_transaction hook executed
+      assert_receive {:after_transaction_destroy_called, _id}, 1000
+    end
+
+    test "load option with :atomic_batches strategy and after_transaction hooks" do
+      # Create an author
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create multiple posts
+      posts =
+        for i <- 1..4 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "load_batch_#{i}", author_id: author.id})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use atomic_batches strategy with load option and after_transaction hooks
+      result =
+        posts
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic_batches,
+          batch_size: 2,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 4
+
+      # Verify load worked for all records
+      for record <- result.records do
+        assert %Author{name: "Test Author"} = record.author
+      end
+
+      # Verify after_transaction hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+
+    test "load option with transaction: :all and after_transaction hooks" do
+      # Create an author
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create posts
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "load_tx_all_#{i}", author_id: author.id})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use stream strategy with transaction: :all and load option
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Verify load worked for all records
+      for record <- result.records do
+        assert %Author{name: "Test Author"} = record.author
+      end
+
+      # Verify after_transaction hooks executed
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+  end
+
+  describe "do_atomic_destroy path coverage" do
+    test "atomic destroy with single record" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "atomic_single"})
+        |> Ash.create!()
+
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+
+      # Verify hook executed
+      assert_receive {:after_transaction_destroy_called, _id}, 1000
+
+      # Verify record actually destroyed
+      assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Query.NotFound{}]}} =
+               Ash.get(Post, post.id)
+    end
+
+    test "atomic destroy with multiple records" do
+      posts =
+        for i <- 1..5 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "atomic_multi_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 5
+
+      # All hooks should execute
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+
+      # All records should be destroyed
+      remaining = Post |> Ash.Query.filter(id in ^post_ids) |> Ash.read!()
+      assert remaining == []
+    end
+
+    test "atomic_batches destroy with after_transaction hooks" do
+      posts =
+        for i <- 1..6 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "atomic_batch_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use list of records with atomic_batches strategy (batch_size requires list input)
+      result =
+        posts
+        |> Ash.bulk_destroy!(
+          :destroy_with_atomic_after_transaction,
+          %{},
+          strategy: :atomic_batches,
+          batch_size: 2,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 6
+
+      # All hooks should execute (one per record across batches)
+      for post_id <- post_ids do
+        assert_receive {:after_transaction_destroy_called, ^post_id}, 1000
+      end
+    end
+
+    test "atomic destroy with hook returning error" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "atomic_error"})
+        |> Ash.create!()
+
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(
+          :destroy_with_atomic_after_transaction_returns_error,
+          %{},
+          strategy: :atomic,
+          return_errors?: true,
+          return_records?: true
+        )
+
+      # Hook returns error after successful destroy
+      assert_receive {:after_transaction_hook_returning_error, _id}, 1000
+
+      # Status should be error due to hook failure
+      assert result.status == :error
+      assert length(result.errors) == 1
+    end
+  end
+
+  # Manual action modules for testing after_transaction hooks with manual destroys
+  defmodule ManualDestroySimple do
+    @moduledoc """
+    Simple manual destroy module that just performs the destroy.
+    After_transaction hooks are added via a separate change module.
+    """
+    use Ash.Resource.ManualDestroy
+
+    def destroy(changeset, _opts, _context) do
+      # Perform the actual destroy using ETS data layer
+      # We need to return {:ok, record} not just :ok
+      case Ash.DataLayer.Ets.destroy(changeset.resource, changeset) do
+        :ok ->
+          {:ok, changeset.data}
+
+        {:error, error} ->
+          {:error, error}
+      end
+    end
+  end
+
+  defmodule ManualDestroyFails do
+    @moduledoc """
+    Manual destroy module that always fails.
+    Used to test after_transaction hook error handling with manual actions.
+    """
+    use Ash.Resource.ManualDestroy
+
+    def destroy(_changeset, _opts, _context) do
+      {:error, "intentional manual destroy error"}
+    end
+  end
+
+  defmodule ManualDestroyAfterTransactionChange do
+    @moduledoc """
+    Change module that adds after_transaction hook for manual destroy testing.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
+        case result do
+          {:ok, record} ->
+            send(self(), {:manual_destroy_after_transaction_success, record.id})
+            {:ok, record}
+
+          {:error, error} ->
+            send(self(), {:manual_destroy_after_transaction_error, error})
+            {:error, error}
+        end
+      end)
+    end
+  end
+
+  defmodule ManualDestroyAfterTransactionConvertsErrorChange do
+    @moduledoc """
+    Change module that adds after_transaction hook that converts errors to success.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
+        case result do
+          {:ok, record} ->
+            {:ok, record}
+
+          {:error, _error} ->
+            send(self(), {:manual_destroy_after_transaction_converted_error})
+            # Return a fake success with the original data
+            {:ok, changeset.data}
+        end
+      end)
+    end
+  end
+
+  defmodule ManualDestroyPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Ets,
+      notifiers: [Notifier]
+
+    alias Ash.Test.Actions.BulkDestroyAfterTransactionTest.{
+      ManualDestroySimple,
+      ManualDestroyFails,
+      ManualDestroyAfterTransactionChange,
+      ManualDestroyAfterTransactionConvertsErrorChange
+    }
+
+    ets do
+      private? true
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, :update, create: :*]
+
+      destroy :destroy_manual_with_after_transaction do
+        manual ManualDestroySimple
+        change ManualDestroyAfterTransactionChange
+      end
+
+      destroy :destroy_manual_with_after_transaction_converts_error do
+        manual ManualDestroyFails
+        change ManualDestroyAfterTransactionConvertsErrorChange
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string, allow_nil?: false, public?: true
+      attribute :title2, :string, public?: true
+    end
+  end
+
+  describe "after_transaction with manual destroy actions" do
+    test "after_transaction hooks work with manual destroy action (single record)" do
+      post =
+        ManualDestroyPost
+        |> Ash.Changeset.for_create(:create, %{title: "manual_destroy_test"})
+        |> Ash.create!()
+
+      result =
+        ManualDestroyPost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy!(
+          :destroy_manual_with_after_transaction,
+          %{},
+          strategy: :stream,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+
+      # Verify after_transaction hook was called
+      assert_receive {:manual_destroy_after_transaction_success, _id}, 1000
+
+      # Verify record was destroyed
+      assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Query.NotFound{}]}} =
+               Ash.get(ManualDestroyPost, post.id)
+    end
+
+    test "after_transaction hooks work with manual destroy action (multiple records)" do
+      posts =
+        for i <- 1..3 do
+          ManualDestroyPost
+          |> Ash.Changeset.for_create(:create, %{title: "manual_bulk_destroy_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        ManualDestroyPost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_manual_with_after_transaction,
+          %{},
+          strategy: :stream,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Verify after_transaction hooks were called for all records
+      assert_receive {:manual_destroy_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_destroy_after_transaction_success, _id2}, 1000
+      assert_receive {:manual_destroy_after_transaction_success, _id3}, 1000
+
+      # Verify all records were destroyed
+      remaining = ManualDestroyPost |> Ash.Query.filter(id in ^post_ids) |> Ash.read!()
+      assert remaining == []
+    end
+
+    test "after_transaction hook can convert error to success in manual destroy" do
+      post =
+        ManualDestroyPost
+        |> Ash.Changeset.for_create(:create, %{title: "will_fail_destroy"})
+        |> Ash.create!()
+
+      result =
+        ManualDestroyPost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(
+          :destroy_manual_with_after_transaction_converts_error,
+          %{},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The hook should have been called
+      assert_receive {:manual_destroy_after_transaction_converted_error}, 1000
+
+      # The result should show success (error converted by hook)
+      assert result.status == :success
+      assert length(result.records) == 1
+    end
+
+    test "manual destroy after_transaction hooks work with return_stream?" do
+      posts =
+        for i <- 1..2 do
+          ManualDestroyPost
+          |> Ash.Changeset.for_create(:create, %{title: "stream_manual_destroy_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result_stream =
+        ManualDestroyPost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy(
+          :destroy_manual_with_after_transaction,
+          %{},
+          strategy: :stream,
+          return_stream?: true,
+          return_records?: true
+        )
+
+      results = Enum.to_list(result_stream)
+      assert length(results) == 2
+
+      # Verify hooks executed
+      assert_receive {:manual_destroy_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_destroy_after_transaction_success, _id2}, 1000
+    end
+
+    test "manual destroy after_transaction hooks work with transaction: :all" do
+      posts =
+        for i <- 1..2 do
+          ManualDestroyPost
+          |> Ash.Changeset.for_create(:create, %{title: "tx_all_manual_destroy_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        ManualDestroyPost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_destroy!(
+          :destroy_manual_with_after_transaction,
+          %{},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 2
+
+      # Verify hooks executed
+      assert_receive {:manual_destroy_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_destroy_after_transaction_success, _id2}, 1000
     end
   end
 end

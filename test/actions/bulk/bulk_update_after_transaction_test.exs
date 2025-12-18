@@ -258,6 +258,54 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
     end
   end
 
+  defmodule AfterTransactionRaisesException do
+    @moduledoc """
+    Change module where after_transaction hook raises an exception.
+    Used to test that exceptions in hooks are caught and converted to errors.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:before_exception_raise, result.id})
+        raise "Hook intentionally raised exception"
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
+  defmodule AfterTransactionWithStopOnError do
+    @moduledoc """
+    Change module where after_transaction hook returns an error for specific records.
+    Used to test stop_on_error? behavior with hook errors.
+    Records with title containing "stop_here" will cause the hook to return an error.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          if String.contains?(result.title, "stop_here") do
+            send(self(), {:hook_error_for_stop_on_error, result.id})
+            {:error, "Hook error to trigger stop"}
+          else
+            send(self(), {:hook_success_for_stop_on_error, result.id})
+            {:ok, result}
+          end
+
+        _changeset, {:error, error} ->
+          {:error, error}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
   defmodule Author do
     @moduledoc false
     use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Ets
@@ -388,6 +436,14 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
 
       update :update_with_after_action_failure_converted_to_success do
         change AfterActionFailsWithAfterTransaction
+      end
+
+      update :update_with_after_transaction_raises_exception do
+        change AfterTransactionRaisesException
+      end
+
+      update :update_with_stop_on_error_hook do
+        change AfterTransactionWithStopOnError
       end
     end
 
@@ -1699,6 +1755,657 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
 
       # Should NOT warn since after_transaction now runs outside the transaction
       refute log =~ "after_transaction"
+    end
+  end
+
+  describe "after_transaction exception handling" do
+    test "exception in hook is caught and converted to error" do
+      # Create a record
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "test"})
+        |> Ash.create!()
+
+      post_id = post.id
+
+      # Use the action with hook that raises exception
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post_id)
+        |> Ash.bulk_update(
+          :update_with_after_transaction_raises_exception,
+          %{title: "updated"},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          authorize?: false
+        )
+
+      # Hook should have sent message before raising
+      assert_receive {:before_exception_raise, ^post_id}
+
+      # Exception should be caught and converted to error
+      assert result.status == :error
+      assert length(result.errors) == 1
+      [error] = result.errors
+      assert Exception.message(error) =~ "Hook intentionally raised exception"
+    end
+
+    test "hook raising exception doesn't crash bulk operation with multiple records" do
+      # Create multiple records
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "test_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use the action with hook that raises exception - with stop_on_error?: false
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(
+          :update_with_after_transaction_raises_exception,
+          %{title: "updated"},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          stop_on_error?: false,
+          authorize?: false
+        )
+
+      # All hooks should have sent messages before raising
+      assert_receive {:before_exception_raise, _id1}
+      assert_receive {:before_exception_raise, _id2}
+      assert_receive {:before_exception_raise, _id3}
+
+      # All exceptions should be caught and converted to errors
+      assert result.status == :error
+      assert length(result.errors) == 3
+    end
+  end
+
+  describe "after_transaction with stop_on_error? (default: true)" do
+    test "hook returns error without return_stream? - error captured in result" do
+      # Create a record
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "stop_here"})
+        |> Ash.create!()
+
+      post_id = post.id
+
+      # Use the action with hook that returns error for "stop_here" titles
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post_id)
+        |> Ash.bulk_update(
+          :update_with_stop_on_error_hook,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          authorize?: false
+        )
+
+      # Hook should have executed and returned error
+      assert_receive {:hook_error_for_stop_on_error, ^post_id}
+
+      # Error should be captured
+      assert result.status == :error
+      assert length(result.errors) == 1
+    end
+
+    test "hook returns error stops processing with default stop_on_error?: true" do
+      # Create multiple records - one that will fail, one that won't
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "stop_here_first"})
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "normal_second"})
+        |> Ash.create!()
+
+      # Query both posts, stop_here will be processed first and cause stop
+      result =
+        Post
+        |> Ash.Query.filter(id in ^[post1.id, post2.id])
+        |> Ash.Query.sort(:title)
+        |> Ash.bulk_update(
+          :update_with_stop_on_error_hook,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          authorize?: false
+          # stop_on_error?: true is the default in test config
+        )
+
+      # With stop_on_error?: true (test default), the error is captured
+      assert result.status == :error
+
+      # The first record should have triggered the error
+      assert_receive {:hook_error_for_stop_on_error, _}
+    end
+
+    test "stop_on_error?: false continues after hook error" do
+      # Create multiple records - some will fail, some will succeed
+      posts =
+        for title <- ["stop_here_1", "normal_1", "stop_here_2", "normal_2"] do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: title})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Explicitly disable stop_on_error
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(
+          :update_with_stop_on_error_hook,
+          %{},
+          strategy: :stream,
+          return_errors?: true,
+          return_records?: true,
+          stop_on_error?: false,
+          authorize?: false
+        )
+
+      # With stop_on_error?: false, all records should be processed
+      # 2 should succeed ("normal_*") and 2 should fail ("stop_here_*")
+      assert_receive {:hook_success_for_stop_on_error, _}
+      assert_receive {:hook_success_for_stop_on_error, _}
+      assert_receive {:hook_error_for_stop_on_error, _}
+      assert_receive {:hook_error_for_stop_on_error, _}
+
+      # partial_success because some succeeded and some failed
+      assert result.status == :partial_success
+      # Should have 2 successes and 2 errors
+      assert length(result.records) == 2
+      assert length(result.errors) == 2
+    end
+  end
+
+  describe "after_transaction with strategy fallback" do
+    test "strategy: [:atomic, :stream] - hooks work when falling back to stream" do
+      # Create records
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "fallback_test_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use strategy list - will try atomic first, then fall back to stream
+      # The action uses require_atomic?: false so it can fall back
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(
+          :update_with_atomic_upgrade_and_after_transaction,
+          %{title: "updated"},
+          strategy: [:atomic, :stream],
+          return_records?: true,
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # after_transaction hooks should execute regardless of which strategy was used
+      assert_receive {:atomic_upgrade_after_transaction_called, _id1}, 1000
+      assert_receive {:atomic_upgrade_after_transaction_called, _id2}, 1000
+      assert_receive {:atomic_upgrade_after_transaction_called, _id3}, 1000
+    end
+
+    test "strategy: :atomic with require_atomic?: false falls back and hooks still work" do
+      # Create a record
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "atomic_fallback"})
+        |> Ash.create!()
+
+      # Use atomic strategy with an action that has require_atomic?: false
+      # This tests the atomic upgrade path
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update!(
+          :update_with_atomic_upgrade_and_after_transaction,
+          %{title: "updated"},
+          strategy: :atomic,
+          return_records?: true,
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+
+      # Hook should still work after fallback
+      assert_receive {:atomic_upgrade_after_transaction_called, _id}, 1000
+    end
+  end
+
+  describe "atomic update with load and after_transaction" do
+    test "load option with :atomic strategy and after_transaction hooks" do
+      # Create an author and post
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "load_test", author_id: author.id})
+        |> Ash.create!()
+
+      # Use atomic strategy with load option and after_transaction hooks
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update!(
+          :update_with_atomic_after_transaction,
+          %{title: "updated"},
+          strategy: :atomic,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+      [updated_post] = result.records
+
+      # Verify load worked
+      assert updated_post.author.name == "Test Author"
+
+      # Verify after_transaction hook executed
+      assert_receive {:after_transaction_called, _id}, 1000
+    end
+
+    test "load option with :atomic_batches strategy and after_transaction hooks" do
+      # Create an author
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create multiple posts
+      posts =
+        for i <- 1..5 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "load_batch_#{i}", author_id: author.id})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use atomic_batches strategy with load option and after_transaction hooks
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(
+          :update_with_atomic_after_transaction,
+          %{title: "batch_updated"},
+          strategy: [:atomic_batches],
+          batch_size: 2,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 5
+
+      # Verify load worked for all records
+      for record <- result.records do
+        assert %Author{name: "Test Author"} = record.author
+      end
+
+      # Verify after_transaction hooks executed
+      for _ <- 1..5 do
+        assert_receive {:after_transaction_called, _id}, 1000
+      end
+    end
+
+    test "load option with transaction: :all and after_transaction hooks" do
+      # Create an author
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      # Create posts
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "load_tx_all_#{i}", author_id: author.id})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Use stream strategy with transaction: :all and load option
+      result =
+        Post
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(
+          :update_with_atomic_after_transaction,
+          %{title: "tx_all_updated"},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Verify load worked for all records
+      for record <- result.records do
+        assert %Author{name: "Test Author"} = record.author
+      end
+
+      # Verify after_transaction hooks executed
+      for _ <- 1..3 do
+        assert_receive {:after_transaction_called, _id}, 1000
+      end
+    end
+
+    # TODO: This behavior is inconsistent with non-atomic strategies where load reflects the final result.
+    #       The atomic path runs load_data BEFORE after_transaction hooks, so loaded data doesn't
+    #       reflect modifications made by hooks. See TODO at bulk.ex around line 578.
+    test "after_transaction hook modifying result - load reflects original data" do
+      # Create an author and post
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Original Author"})
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "hook_modify_test", author_id: author.id})
+        |> Ash.create!()
+
+      # Use the action that modifies title in after_transaction
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update!(
+          :update_with_after_transaction,
+          %{title: "modified"},
+          strategy: :stream,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+      [updated_post] = result.records
+
+      # The after_transaction hook appends "_stuff" to the title
+      assert updated_post.title == "modified_stuff"
+
+      # Load should still work
+      assert updated_post.author.name == "Original Author"
+    end
+  end
+
+  # Manual action modules for testing after_transaction hooks with manual updates
+  defmodule ManualUpdateSimple do
+    @moduledoc """
+    Simple manual update module that just performs the update.
+    After_transaction hooks are added via a separate change module.
+    """
+    use Ash.Resource.ManualUpdate
+
+    def update(changeset, _opts, _context) do
+      # Perform the actual update using ETS data layer
+      Ash.DataLayer.Ets.update(changeset.resource, changeset)
+    end
+  end
+
+  defmodule ManualUpdateFails do
+    @moduledoc """
+    Manual update module that always fails.
+    Used to test after_transaction hook error handling with manual actions.
+    """
+    use Ash.Resource.ManualUpdate
+
+    def update(_changeset, _opts, _context) do
+      {:error, "intentional manual update error"}
+    end
+  end
+
+  defmodule ManualUpdateAfterTransactionChange do
+    @moduledoc """
+    Change module that adds after_transaction hook for manual update testing.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
+        case result do
+          {:ok, record} ->
+            send(self(), {:manual_update_after_transaction_success, record.id})
+            {:ok, record}
+
+          {:error, error} ->
+            send(self(), {:manual_update_after_transaction_error, error})
+            {:error, error}
+        end
+      end)
+    end
+  end
+
+  defmodule ManualUpdateAfterTransactionConvertsErrorChange do
+    @moduledoc """
+    Change module that adds after_transaction hook that converts errors to success.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
+        case result do
+          {:ok, record} ->
+            {:ok, record}
+
+          {:error, _error} ->
+            send(self(), {:manual_update_after_transaction_converted_error})
+            # Return a fake success with the original data
+            {:ok, changeset.data}
+        end
+      end)
+    end
+  end
+
+  defmodule ManualUpdatePost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Ets,
+      notifiers: [Notifier]
+
+    alias Ash.Test.Actions.BulkUpdateAfterTransactionTest.{
+      ManualUpdateSimple,
+      ManualUpdateFails,
+      ManualUpdateAfterTransactionChange,
+      ManualUpdateAfterTransactionConvertsErrorChange
+    }
+
+    ets do
+      private? true
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, :destroy, create: :*]
+
+      update :update_manual_with_after_transaction do
+        accept [:title, :title2]
+        manual ManualUpdateSimple
+        change ManualUpdateAfterTransactionChange
+      end
+
+      update :update_manual_with_after_transaction_converts_error do
+        accept [:title, :title2]
+        manual ManualUpdateFails
+        change ManualUpdateAfterTransactionConvertsErrorChange
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string, allow_nil?: false, public?: true
+      attribute :title2, :string, public?: true
+    end
+  end
+
+  describe "after_transaction with manual update actions" do
+    test "after_transaction hooks work with manual update action (single record)" do
+      post =
+        ManualUpdatePost
+        |> Ash.Changeset.for_create(:create, %{title: "manual_update_test"})
+        |> Ash.create!()
+
+      result =
+        ManualUpdatePost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update!(
+          :update_manual_with_after_transaction,
+          %{title: "updated_manual"},
+          strategy: :stream,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+      assert hd(result.records).title == "updated_manual"
+
+      # Verify after_transaction hook was called
+      assert_receive {:manual_update_after_transaction_success, _id}, 1000
+    end
+
+    test "after_transaction hooks work with manual update action (multiple records)" do
+      posts =
+        for i <- 1..3 do
+          ManualUpdatePost
+          |> Ash.Changeset.for_create(:create, %{title: "manual_bulk_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        ManualUpdatePost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(
+          :update_manual_with_after_transaction,
+          %{title: "bulk_updated"},
+          strategy: :stream,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Verify after_transaction hooks were called for all records
+      assert_receive {:manual_update_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_update_after_transaction_success, _id2}, 1000
+      assert_receive {:manual_update_after_transaction_success, _id3}, 1000
+    end
+
+    test "after_transaction hook can convert error to success in manual update" do
+      post =
+        ManualUpdatePost
+        |> Ash.Changeset.for_create(:create, %{title: "will_fail_update"})
+        |> Ash.create!()
+
+      result =
+        ManualUpdatePost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(
+          :update_manual_with_after_transaction_converts_error,
+          %{title: "should_fail"},
+          strategy: :stream,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The hook should have been called
+      assert_receive {:manual_update_after_transaction_converted_error}, 1000
+
+      # The result should show success (error converted by hook)
+      assert result.status == :success
+      assert length(result.records) == 1
+    end
+
+    test "manual update after_transaction hooks work with return_stream?" do
+      posts =
+        for i <- 1..2 do
+          ManualUpdatePost
+          |> Ash.Changeset.for_create(:create, %{title: "stream_manual_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result_stream =
+        ManualUpdatePost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update(
+          :update_manual_with_after_transaction,
+          %{title: "stream_updated"},
+          strategy: :stream,
+          return_stream?: true,
+          return_records?: true
+        )
+
+      results = Enum.to_list(result_stream)
+      assert length(results) == 2
+
+      # Verify hooks executed
+      assert_receive {:manual_update_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_update_after_transaction_success, _id2}, 1000
+    end
+
+    test "manual update after_transaction hooks work with transaction: :all" do
+      posts =
+        for i <- 1..2 do
+          ManualUpdatePost
+          |> Ash.Changeset.for_create(:create, %{title: "tx_all_manual_#{i}"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      result =
+        ManualUpdatePost
+        |> Ash.Query.filter(id in ^post_ids)
+        |> Ash.bulk_update!(
+          :update_manual_with_after_transaction,
+          %{title: "tx_updated"},
+          strategy: :stream,
+          transaction: :all,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 2
+
+      # Verify hooks executed
+      assert_receive {:manual_update_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_update_after_transaction_success, _id2}, 1000
     end
   end
 end

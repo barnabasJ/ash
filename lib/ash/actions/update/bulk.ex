@@ -2010,10 +2010,8 @@ defmodule Ash.Actions.Update.Bulk do
               metadata_key,
               ref_metadata_key,
               context_key,
-              base_changeset,
               must_return_records_for_changes?,
               changes,
-              must_be_simple_results,
               action_select
             )
           end,
@@ -2039,12 +2037,8 @@ defmodule Ash.Actions.Update.Bulk do
               all_tagged_results,
               opts,
               ref,
-              batch,
-              changesets_by_ref,
-              changesets_by_index,
               context_key,
               metadata_key,
-              ref_metadata_key,
               resource,
               domain,
               base_changeset
@@ -2090,10 +2084,8 @@ defmodule Ash.Actions.Update.Bulk do
           metadata_key,
           ref_metadata_key,
           context_key,
-          base_changeset,
           must_return_records_for_changes?,
           changes,
-          must_be_simple_results,
           action_select
         )
 
@@ -2104,12 +2096,8 @@ defmodule Ash.Actions.Update.Bulk do
         all_tagged_results,
         opts,
         ref,
-        batch,
-        changesets_by_ref,
-        changesets_by_index,
         context_key,
         metadata_key,
-        ref_metadata_key,
         resource,
         domain,
         base_changeset
@@ -2139,10 +2127,8 @@ defmodule Ash.Actions.Update.Bulk do
          metadata_key,
          ref_metadata_key,
          context_key,
-         _base_changeset,
          must_return_records_for_changes?,
          changes,
-         _must_be_simple_results,
          action_select
        ) do
     must_return_records? =
@@ -2197,14 +2183,11 @@ defmodule Ash.Actions.Update.Bulk do
         changes,
         all_changes,
         success_results,
-        changesets_by_ref,
-        changesets_by_index,
         batch,
         opts,
         ref,
         resource,
-        metadata_key,
-        ref_metadata_key
+        metadata_key
       )
 
     # Rebuild tagged results with updated success results
@@ -3010,12 +2993,8 @@ defmodule Ash.Actions.Update.Bulk do
          tagged_results,
          opts,
          ref,
-         _changesets,
-         _changesets_by_ref,
-         _changesets_by_index,
          context_key,
          metadata_key,
-         _ref_metadata_key,
          resource,
          domain,
          base_changeset
@@ -3162,20 +3141,27 @@ defmodule Ash.Actions.Update.Bulk do
         changes,
         all_changes,
         results,
-        changesets_by_ref,
-        changesets_by_index,
         changesets,
         opts,
         ref,
         resource,
-        metadata_key,
-        ref_metadata_key \\ nil
+        metadata_key
       ) do
     source_context =
       case changesets do
         [cs | _] -> cs.context
         _ -> %{}
       end
+
+    {results, errors} =
+      results
+      |> Enum.split_with(fn
+        {:ok, _, _} ->
+          true
+
+        _other ->
+          false
+      end)
 
     context =
       struct(
@@ -3196,22 +3182,20 @@ defmodule Ash.Actions.Update.Bulk do
         results
 
       {%{change: {module, change_opts}}, index}, results ->
-        records = results
+        records = results |> Enum.map(&elem(&1, 1))
+
+        {results, errors} =
+          results
+          |> Enum.split_with(fn
+            {:ok, _, _} ->
+              true
+
+            _other ->
+              false
+          end)
 
         if changes[index] == :all do
-          results =
-            Enum.map(results, fn result ->
-              changeset =
-                find_changeset(
-                  result,
-                  changesets_by_ref,
-                  metadata_key,
-                  ref_metadata_key,
-                  changesets_by_index
-                )
-
-              {changeset, result}
-            end)
+          dbg(:all)
 
           case change_opts do
             {:templated, change_opts} ->
@@ -3224,11 +3208,11 @@ defmodule Ash.Actions.Update.Bulk do
                   context
                 )
               else
-                Enum.map(results, &{:ok, elem(&1, 1)})
+                results
               end
 
             change_opts ->
-              Enum.flat_map(results, fn {changeset, record} = result ->
+              Enum.flat_map(results, fn {:ok, record, changeset} = result ->
                 change_opts =
                   templated_opts(
                     change_opts,
@@ -3243,12 +3227,30 @@ defmodule Ash.Actions.Update.Bulk do
                      module.has_batch_change?() &&
                      module.batch_callbacks?(changesets, change_opts, context) do
                   module.after_batch(
-                    [result],
+                    [{changeset, record}],
                     change_opts,
                     context
                   )
+                  |> case do
+                    :ok ->
+                      [{:ok, record, changeset}]
+
+                    results ->
+                      results
+                      |> Enum.zip(changesets)
+                      |> Enum.map(fn
+                        {{:ok, result}, changeset} ->
+                          {:ok, result, changeset}
+
+                        {{:error, error}, changeset} ->
+                          {:error, error, changeset}
+
+                        {notification, _changeset} ->
+                          notification
+                      end)
+                  end
                 else
-                  [{:ok, record}]
+                  [{:ok, record, changeset}]
                 end
               end)
           end
@@ -3257,35 +3259,11 @@ defmodule Ash.Actions.Update.Bulk do
           {matches, non_matches} =
             results
             |> Enum.split_with(fn
-              {:ok, result} ->
-                result_matches_changes?(
-                  result,
-                  changes[index],
-                  changesets_by_ref,
-                  changesets_by_index,
-                  metadata_key,
-                  ref_metadata_key
-                )
-
-              _ ->
-                false
+              {_changeset, result} ->
+                result.__metadata__[metadata_key] in List.wrap(changes)
             end)
 
-          match_records = matches
-
-          matches =
-            Enum.map(matches, fn match ->
-              changeset =
-                find_changeset(
-                  match,
-                  changesets_by_ref,
-                  metadata_key,
-                  ref_metadata_key,
-                  changesets_by_index
-                )
-
-              {changeset, match}
-            end)
+          match_records = Enum.map(matches, &elem(&1, 1))
 
           after_batch_results =
             case change_opts do
@@ -3309,7 +3287,7 @@ defmodule Ash.Actions.Update.Bulk do
                     )
                   )
                 else
-                  Enum.map(matches, &{:ok, elem(&1, 1)})
+                  Enum.map(matches, &{:ok, elem(&1, 1), elem(&1, 0)})
                 end
 
               change_opts ->
@@ -3343,7 +3321,7 @@ defmodule Ash.Actions.Update.Bulk do
                       )
                     )
                   else
-                    [{:ok, record}]
+                    [{:ok, record, changeset}]
                   end
                 end)
             end
@@ -3351,35 +3329,39 @@ defmodule Ash.Actions.Update.Bulk do
 
           Enum.concat([after_batch_results, non_matches])
         end
+        |> Enum.concat(errors)
     end)
+    |> Enum.concat(errors)
   end
 
-  defp handle_after_batch_results(:ok, matches, _ref, _resource, _options), do: matches
+  defp handle_after_batch_results(:ok, matches, _ref, _resource, _options),
+    do: dbg(matches)
 
   defp handle_after_batch_results(results, _matches, ref, resource, opts) do
-    Enum.flat_map(
-      results,
-      fn
-        %Ash.Notifier.Notification{} = notification ->
-          store_notification(ref, notification, opts)
+    results
+    |> Enum.flat_map(fn
+      {%Ash.Notifier.Notification{} = notification, _} ->
+        store_notification(ref, notification, opts)
 
-        {:ok, result} ->
-          [result]
+      {:ok, result, changeset} ->
+        [{:ok, result, changeset}]
 
-        {:error, error} ->
-          if opts[:transaction] && opts[:rollback_on_error?] do
-            if Ash.DataLayer.in_transaction?(resource) do
-              Ash.DataLayer.rollback(
-                resource,
-                error
-              )
-            end
+      {:error, error, changeset} ->
+        if opts[:transaction] && opts[:rollback_on_error?] do
+          if Ash.DataLayer.in_transaction?(resource) do
+            Ash.DataLayer.rollback(
+              resource,
+              error
+            )
           end
+        end
 
-          store_error(ref, error, opts)
-          []
-      end
-    )
+        if opts[:stop_on_error?] && !opts[:return_stream?] do
+          throw({:error, Ash.Error.to_error_class(error), 0})
+        end
+
+        [{:error, error, changeset}]
+    end)
   end
 
   defp notification(changeset, result, opts) do

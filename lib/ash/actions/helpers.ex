@@ -1053,4 +1053,37 @@ defmodule Ash.Actions.Helpers do
       Ash.Resource.put_metadata(result, ref_key, ref)
     end
   end
+
+  @doc """
+  Splits a list of changesets into valid and invalid ones.
+
+  Returns a tuple where the first element contains valid changesets and the second
+  contains error tuples for invalid changesets in the form `{:error, error, changeset}`.
+
+  If `stop_on_error?` is true and `return_stream?` is false, throws on the first
+  invalid changeset encountered.
+  """
+  @spec split_valid_invalid_changesets([Ash.Changeset.t()], Keyword.t()) ::
+          {[Ash.Changeset.t()], [{:error, Ash.Error.t(), Ash.Changeset.t()}]}
+  def split_valid_invalid_changesets(changesets, opts) do
+    changesets
+    |> Enum.reduce({[], []}, fn
+      %{valid?: false} = changeset, {batch_acc, results_acc} ->
+        # in case of stop_on_error? we need to throw from here
+        # and stop processing further changesets
+        error = Ash.Error.to_error_class(changeset.errors, changeset: changeset)
+
+        if opts[:stop_on_error?] && !opts[:return_stream?] do
+          throw({:error, Ash.Error.to_error_class(error), 0})
+        end
+
+        {batch_acc, [{:error, error, changeset} | results_acc]}
+
+      changeset, {batch_acc, results_acc} ->
+        {[changeset | batch_acc], results_acc}
+    end)
+    |> then(fn {batch, invalid_changeset_errors} ->
+      {Enum.reverse(batch), Enum.reverse(invalid_changeset_errors)}
+    end)
+  end
 end

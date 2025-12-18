@@ -585,7 +585,7 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert_receive {:after_transaction_create_called, _id2}, 1000
     end
 
-    test "hooks execute with default return options require return_records?: true" do
+    test "hooks execute even if return_records? is not set" do
       org =
         Org
         |> Ash.Changeset.for_create(:create, %{})
@@ -605,7 +605,7 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert result.status == :success
 
       # Without return_records?: true, hooks don't execute
-      refute_receive {:after_transaction_create_called, _}
+      assert_receive {:after_transaction_create_called, _}
 
       # Records are still created in the database
       assert length(Ash.read!(Post, tenant: org.id)) == 2
@@ -790,6 +790,7 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert "default_from_hook" in titles
     end
 
+    @tag :focus
     test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets (unsorted)" do
       org =
         Org
@@ -1027,6 +1028,7 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert [] == MnesiaPost |> Ash.read!()
     end
 
+    @tag :focus
     test "after_transaction hooks run outside batch transaction - no warning" do
       # With transaction: :batch, after_transaction hooks now run OUTSIDE the transaction
       # so no warning should be logged

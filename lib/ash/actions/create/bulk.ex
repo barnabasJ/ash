@@ -771,7 +771,6 @@ defmodule Ash.Actions.Create.Bulk do
         :bulk_create_index
       )
     )
-    |> dbg()
   end
 
   defp setup_changeset(

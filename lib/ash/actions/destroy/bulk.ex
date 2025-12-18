@@ -2193,7 +2193,10 @@ defmodule Ash.Actions.Destroy.Bulk do
                     mod.destroy(changeset, manual_opts, ctx)
                     |> Ash.Actions.BulkManualActionHelpers.process_non_bulk_result(
                       changeset,
-                      :bulk_destroy
+                      :bulk_destroy,
+                      &store_notification/3,
+                      ref,
+                      opts
                     )
                   ]
                 end
@@ -2202,9 +2205,11 @@ defmodule Ash.Actions.Destroy.Bulk do
                   mod,
                   :bulk_destroy,
                   &store_notification/3,
-                  &store_error/3,
                   ref,
-                  opts
+                  opts,
+                  batch,
+                  changesets_by_ref,
+                  changesets_by_index
                 )
 
               _ ->
@@ -2242,6 +2247,20 @@ defmodule Ash.Actions.Destroy.Bulk do
             end
 
           case result do
+            # Manual action path: already tagged with changesets
+            # Don't throw on error here - let errors flow through to process_results
+            # so that after_transaction hooks can run and potentially convert errors to success
+            {:manual_tagged, tagged_results} ->
+              # Check if there were any successes
+              if Enum.any?(tagged_results, fn
+                   {:ok, _, _} -> true
+                   _ -> false
+                 end) do
+                Process.put({:any_success?, ref}, true)
+              end
+
+              tagged_results
+
             {:ok, result} ->
               Process.put({:any_success?, ref}, true)
               result
@@ -2259,6 +2278,14 @@ defmodule Ash.Actions.Destroy.Bulk do
         end)
         # Wrap results in tuples with embedded changesets
         |> Enum.flat_map(fn
+          # Already tagged (from manual path) - pass through
+          {:ok, result, changeset} when is_struct(changeset, Ash.Changeset) ->
+            [{:ok, result, changeset}]
+
+          {:error, error, changeset} when is_struct(changeset, Ash.Changeset) ->
+            [{:error, error, changeset}]
+
+          # Data layer path - needs changeset lookup
           result when is_struct(result) ->
             changeset =
               Ash.Actions.Helpers.lookup_changeset(

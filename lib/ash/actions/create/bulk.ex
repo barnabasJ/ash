@@ -1255,7 +1255,10 @@ defmodule Ash.Actions.Create.Bulk do
                     mod.create(changeset, manual_opts, ctx)
                     |> Ash.Actions.BulkManualActionHelpers.process_non_bulk_result(
                       changeset,
-                      :bulk_create
+                      :bulk_create,
+                      &store_notification/3,
+                      ref,
+                      opts
                     )
                   ]
                 end
@@ -1264,9 +1267,11 @@ defmodule Ash.Actions.Create.Bulk do
                   mod,
                   :bulk_create,
                   &store_notification/3,
-                  &store_error/3,
                   ref,
-                  opts
+                  opts,
+                  batch,
+                  changesets_by_ref,
+                  changesets_by_index
                 )
 
               _ ->
@@ -1377,6 +1382,20 @@ defmodule Ash.Actions.Create.Bulk do
             end
 
           case result do
+            # Manual action path: already tagged with changesets
+            # Don't throw on error here - let errors flow through to process_results
+            # so that after_transaction hooks can run and potentially convert errors to success
+            {:manual_tagged, tagged_results} ->
+              # Check if there were any successes
+              if Enum.any?(tagged_results, fn
+                   {:ok, _, _} -> true
+                   _ -> false
+                 end) do
+                Process.put({:any_success?, ref}, true)
+              end
+
+              tagged_results
+
             {:ok, result} ->
               result =
                 if tenant = opts[:tenant] do
@@ -1403,19 +1422,15 @@ defmodule Ash.Actions.Create.Bulk do
           end
         end)
         |> Enum.flat_map(fn
-          result ->
-            changeset =
-              Ash.Actions.Helpers.lookup_changeset(
-                result,
-                changesets_by_ref,
-                changesets_by_index,
-                index_key: :bulk_create_index,
-                ref_key: :bulk_action_ref
-              )
-
+          # Already tagged (from manual path) - pass through
+          {:ok, result, changeset} when is_struct(changeset, Ash.Changeset) ->
             [{:ok, result, changeset}]
 
-          {:ok, result} ->
+          {:error, error, changeset} when is_struct(changeset, Ash.Changeset) ->
+            [{:error, error, changeset}]
+
+          # Data layer path - needs changeset lookup
+          result when is_struct(result) ->
             changeset =
               Ash.Actions.Helpers.lookup_changeset(
                 result,

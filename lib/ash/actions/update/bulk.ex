@@ -3182,8 +3182,6 @@ defmodule Ash.Actions.Update.Bulk do
         results
 
       {%{change: {module, change_opts}}, index}, results ->
-        records = results |> Enum.map(&elem(&1, 1))
-
         {results, errors} =
           results
           |> Enum.split_with(fn
@@ -3195,7 +3193,9 @@ defmodule Ash.Actions.Update.Bulk do
           end)
 
         if changes[index] == :all do
-          dbg(:all)
+          # Transform {:ok, result, changeset} to {changeset, result} for after_batch callbacks
+          results_for_callback =
+            Enum.map(results, fn {:ok, result, changeset} -> {changeset, result} end)
 
           case change_opts do
             {:templated, change_opts} ->
@@ -3203,7 +3203,7 @@ defmodule Ash.Actions.Update.Bulk do
                    module.has_batch_change?() &&
                    module.batch_callbacks?(changesets, change_opts, context) do
                 module.after_batch(
-                  results,
+                  results_for_callback,
                   change_opts,
                   context
                 )
@@ -3212,7 +3212,7 @@ defmodule Ash.Actions.Update.Bulk do
               end
 
             change_opts ->
-              Enum.flat_map(results, fn {:ok, record, changeset} = result ->
+              Enum.flat_map(results_for_callback, fn {changeset, record} ->
                 change_opts =
                   templated_opts(
                     change_opts,
@@ -3254,16 +3254,18 @@ defmodule Ash.Actions.Update.Bulk do
                 end
               end)
           end
-          |> handle_after_batch_results(records, ref, resource, opts)
+          |> handle_after_batch_results(results, ref, resource, opts)
         else
           {matches, non_matches} =
             results
             |> Enum.split_with(fn
-              {_changeset, result} ->
-                result.__metadata__[metadata_key] in List.wrap(changes)
+              {:ok, result, _changeset} ->
+                result.__metadata__[metadata_key] in List.wrap(changes[index])
             end)
 
-          match_records = Enum.map(matches, &elem(&1, 1))
+          # Transform {:ok, result, changeset} to {changeset, result} for after_batch callbacks
+          matches_for_callback =
+            Enum.map(matches, fn {:ok, result, changeset} -> {changeset, result} end)
 
           after_batch_results =
             case change_opts do
@@ -3272,7 +3274,7 @@ defmodule Ash.Actions.Update.Bulk do
                      module.has_batch_change?() &&
                      module.batch_callbacks?(changesets, change_opts, context) do
                   module.after_batch(
-                    matches,
+                    matches_for_callback,
                     change_opts,
                     struct(
                       Ash.Resource.Change.Context,
@@ -3287,11 +3289,11 @@ defmodule Ash.Actions.Update.Bulk do
                     )
                   )
                 else
-                  Enum.map(matches, &{:ok, elem(&1, 1), elem(&1, 0)})
+                  matches
                 end
 
               change_opts ->
-                Enum.flat_map(matches, fn {changeset, record} = result ->
+                Enum.flat_map(matches_for_callback, fn {changeset, record} = result ->
                   if module.has_after_batch?() &&
                        module.has_batch_change?() &&
                        module.batch_callbacks?(changesets, change_opts, context) do
@@ -3320,12 +3322,30 @@ defmodule Ash.Actions.Update.Bulk do
                         }
                       )
                     )
+                    |> case do
+                      :ok ->
+                        [{:ok, record, changeset}]
+
+                      results ->
+                        results
+                        |> Enum.zip(changesets)
+                        |> Enum.map(fn
+                          {{:ok, result}, changeset} ->
+                            {:ok, result, changeset}
+
+                          {{:error, error}, changeset} ->
+                            {:error, error, changeset}
+
+                          {notification, _changeset} ->
+                            notification
+                        end)
+                    end
                   else
                     [{:ok, record, changeset}]
                   end
                 end)
             end
-            |> handle_after_batch_results(match_records, ref, resource, opts)
+            |> handle_after_batch_results(matches, ref, resource, opts)
 
           Enum.concat([after_batch_results, non_matches])
         end
@@ -3335,7 +3355,7 @@ defmodule Ash.Actions.Update.Bulk do
   end
 
   defp handle_after_batch_results(:ok, matches, _ref, _resource, _options),
-    do: dbg(matches)
+    do: matches
 
   defp handle_after_batch_results(results, _matches, ref, resource, opts) do
     results
@@ -3851,41 +3871,6 @@ defmodule Ash.Actions.Update.Bulk do
 
   defp ensure_changeset!(changeset, _result, _metadata_key, _ref_metadata_key) do
     changeset
-  end
-
-  defp result_matches_changes?(
-         result,
-         changes,
-         _changesets_by_ref,
-         _changesets_by_index,
-         metadata_key,
-         nil = _ref_metadata_key
-       ) do
-    result.__metadata__[metadata_key] in List.wrap(changes)
-  end
-
-  defp result_matches_changes?(
-         result,
-         changes,
-         changesets_by_ref,
-         changesets_by_index,
-         metadata_key,
-         ref_metadata_key
-       ) do
-    ref_key =
-      with nil <- result.__metadata__[ref_metadata_key],
-           index when not is_nil(index) <- result.__metadata__[metadata_key] do
-        changesets_by_index[index]
-      else
-        ref when not is_nil(ref) -> ref
-        _ -> nil
-      end
-
-    changesets_by_ref
-    |> Map.get(ref_key)
-    |> ensure_changeset!(result, metadata_key, ref_metadata_key)
-
-    ref_key in List.wrap(changes)
   end
 
   defp clear_ref_metadata(record) do

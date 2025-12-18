@@ -4634,7 +4634,6 @@ defmodule Ash.Changeset do
 
   @doc false
   def run_after_transactions(result, changeset) do
-    dbg([result, changeset])
     warn_on_transaction_hooks(changeset, changeset.after_transaction, "after_transaction")
 
     changeset = set_phase(changeset, :after_transaction)

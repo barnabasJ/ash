@@ -790,7 +790,6 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert "default_from_hook" in titles
     end
 
-    @tag :focus
     test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets (unsorted)" do
       org =
         Org
@@ -1028,7 +1027,6 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert [] == MnesiaPost |> Ash.read!()
     end
 
-    @tag :focus
     test "after_transaction hooks run outside batch transaction - no warning" do
       # With transaction: :batch, after_transaction hooks now run OUTSIDE the transaction
       # so no warning should be logged

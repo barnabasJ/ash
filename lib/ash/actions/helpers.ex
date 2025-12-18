@@ -1065,7 +1065,7 @@ defmodule Ash.Actions.Helpers do
   """
   @spec split_valid_invalid_changesets([Ash.Changeset.t()], Keyword.t()) ::
           {[Ash.Changeset.t()], [{:error, Ash.Error.t(), Ash.Changeset.t()}]}
-  def split_valid_invalid_changesets(changesets, opts) do
+  def split_valid_invalid_changesets(changesets, _opts) do
     changesets
     |> Enum.reduce({[], []}, fn
       %{valid?: false} = changeset, {batch_acc, results_acc} ->
@@ -1073,9 +1073,12 @@ defmodule Ash.Actions.Helpers do
         # and stop processing further changesets
         error = Ash.Error.to_error_class(changeset.errors, changeset: changeset)
 
-        if opts[:stop_on_error?] && !opts[:return_stream?] do
-          throw({:error, Ash.Error.to_error_class(error), 0})
-        end
+        # TOOD decide if we wanna throw here or not.
+        # we could say stop on error just stops after the current batch
+        # that would make it more predictable and we can just throw at the end after after_transaction
+        # if opts[:stop_on_error?] && !opts[:return_stream?] do
+        #   throw({:error, Ash.Error.to_error_class(error), 0})
+        # end
 
         {batch_acc, [{:error, error, changeset} | results_acc]}
 

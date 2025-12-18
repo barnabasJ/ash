@@ -930,29 +930,29 @@ defmodule Ash.Actions.Update.Bulk do
           Ash.DataLayer.rollback(atomic_changeset.resource, Ash.Error.to_error_class(error))
         else
           # Run after_transaction hooks for failed changesets
-            case Ash.Changeset.run_after_transactions(
-                   {:error,
-                    Ash.Error.to_error_class(error,
-                      bread_crumbs: [
-                        "Returned from bulk query update: #{inspect(atomic_changeset.resource)}.#{atomic_changeset.action.name}"
-                      ]
-                    )},
-                   changeset
-                 ) do
-              {:ok, result} ->
-                %Ash.BulkResult{
-                  status: :success,
-                  records: [result]
-                }
+          case Ash.Changeset.run_after_transactions(
+                 {:error,
+                  Ash.Error.to_error_class(error,
+                    bread_crumbs: [
+                      "Returned from bulk query update: #{inspect(atomic_changeset.resource)}.#{atomic_changeset.action.name}"
+                    ]
+                  )},
+                 changeset
+               ) do
+            {:ok, result} ->
+              %Ash.BulkResult{
+                status: :success,
+                records: [result]
+              }
 
-              {:error, hook_error} ->
-                %Ash.BulkResult{
-                  status: :error,
-                  error_count: 1,
-                  notifications: [],
-                  errors: [hook_error]
-                }
-            end
+            {:error, hook_error} ->
+              %Ash.BulkResult{
+                status: :error,
+                error_count: 1,
+                notifications: [],
+                errors: [hook_error]
+              }
+          end
         end
 
       {:error, %Ash.Error.Forbidden.InitialDataRequired{} = e} ->
@@ -2722,7 +2722,10 @@ defmodule Ash.Actions.Update.Bulk do
                     mod.update(changeset, manual_opts, ctx)
                     |> Ash.Actions.BulkManualActionHelpers.process_non_bulk_result(
                       changeset,
-                      :bulk_update
+                      :bulk_update,
+                      &store_notification/3,
+                      ref,
+                      opts
                     )
                   ]
                 end
@@ -2731,9 +2734,11 @@ defmodule Ash.Actions.Update.Bulk do
                   mod,
                   :bulk_update,
                   &store_notification/3,
-                  &store_error/3,
                   ref,
-                  opts
+                  opts,
+                  batch,
+                  changesets_by_ref,
+                  changesets_by_index
                 )
 
               _ ->
@@ -2805,6 +2810,20 @@ defmodule Ash.Actions.Update.Bulk do
             end
 
           case result do
+            # Manual action path: already tagged with changesets
+            # Don't throw on error here - let errors flow through to process_results
+            # so that after_transaction hooks can run and potentially convert errors to success
+            {:manual_tagged, tagged_results} ->
+              # Check if there were any successes
+              if Enum.any?(tagged_results, fn
+                   {:ok, _, _} -> true
+                   _ -> false
+                 end) do
+                Process.put({:any_success?, ref}, true)
+              end
+
+              tagged_results
+
             {:ok, result} ->
               Process.put({:any_success?, ref}, true)
               result
@@ -2819,6 +2838,14 @@ defmodule Ash.Actions.Update.Bulk do
         end)
         # Wrap results in tuples with embedded changesets
         |> Enum.flat_map(fn
+          # Already tagged (from manual path) - pass through
+          {:ok, result, changeset} when is_struct(changeset, Ash.Changeset) ->
+            [{:ok, result, changeset}]
+
+          {:error, error, changeset} when is_struct(changeset, Ash.Changeset) ->
+            [{:error, error, changeset}]
+
+          # Data layer path - needs changeset lookup
           result when is_struct(result) ->
             changeset =
               Ash.Actions.Helpers.lookup_changeset(

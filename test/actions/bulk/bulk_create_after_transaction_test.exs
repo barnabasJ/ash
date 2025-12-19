@@ -5,6 +5,13 @@
 defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
   @moduledoc """
   Tests for after_transaction hooks in bulk create operations.
+
+  Tests are organized by execution mode:
+  - `transaction: :batch` - Default batch transaction mode
+  - `transaction: :all` - Single transaction wrapping all records
+  - `return_stream?` - Streaming mode
+  - `upsert` - Upsert-specific tests
+  - `manual actions` - Manual action tests
   """
   use ExUnit.Case, async: true
 
@@ -173,6 +180,92 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
 
         _changeset, {:error, error} ->
           {:error, error}
+      end)
+    end
+  end
+
+  defmodule ManualCreateSimple do
+    @moduledoc """
+    Simple manual create module that just performs the create.
+    After_transaction hooks are added via a separate change module.
+    """
+    use Ash.Resource.ManualCreate
+
+    def create(changeset, _opts, _context) do
+      # Perform the actual create using ETS data layer
+      Ash.DataLayer.Ets.create(changeset.resource, changeset)
+    end
+
+    def bulk_create(changesets, _opts, _context) do
+      Enum.map(changesets, fn changeset ->
+        case Ash.DataLayer.Ets.create(changeset.resource, changeset) do
+          {:ok, record} ->
+            record =
+              Ash.Resource.put_metadata(
+                record,
+                :bulk_create_index,
+                changeset.context.bulk_create.index
+              )
+
+            {:ok, record}
+
+          {:error, error} ->
+            {:error, error}
+        end
+      end)
+    end
+  end
+
+  defmodule ManualCreateFails do
+    @moduledoc """
+    Manual create module that always fails.
+    Used to test after_transaction hook error handling with manual actions.
+    """
+    use Ash.Resource.ManualCreate
+
+    def create(_changeset, _opts, _context) do
+      {:error, "intentional manual create error"}
+    end
+  end
+
+  defmodule ManualAfterTransactionChange do
+    @moduledoc """
+    Change module that adds after_transaction hook for manual action testing.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
+        case result do
+          {:ok, record} ->
+            send(self(), {:manual_after_transaction_success, record.id})
+            {:ok, record}
+
+          {:error, error} ->
+            send(self(), {:manual_after_transaction_error, error})
+            {:error, error}
+        end
+      end)
+    end
+  end
+
+  defmodule ManualAfterTransactionConvertsErrorChange do
+    @moduledoc """
+    Change module that adds after_transaction hook that converts errors to success.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
+        case result do
+          {:ok, record} ->
+            {:ok, record}
+
+          {:error, _error} ->
+            send(self(), {:manual_after_transaction_converted_error})
+            # Return a fake success
+            {:ok, %{changeset.data | id: Ash.UUID.generate(), title: "manual_recovered"}}
+        end
       end)
     end
   end
@@ -431,68 +524,75 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
     end
   end
 
-  describe "after_transaction hooks with return_stream?" do
-    test "hooks work with return_stream?" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
+  defmodule ManualPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Ets,
+      notifiers: [Notifier]
 
-      # return_stream?: true streams results back
-      result_stream =
-        Ash.bulk_create(
-          [%{title: "title1"}, %{title: "title2"}, %{title: "title3"}],
-          Post,
-          :create_with_after_transaction_hook,
-          tenant: org.id,
-          return_stream?: true,
-          return_records?: true,
-          authorize?: false
-        )
+    alias Ash.Test.Actions.BulkCreateAfterTransactionTest.{
+      Org,
+      ManualCreateSimple,
+      ManualCreateFails,
+      ManualAfterTransactionChange,
+      ManualAfterTransactionConvertsErrorChange
+    }
 
-      # Consume the stream
-      results = Enum.to_list(result_stream)
-      assert length(results) == 3
-
-      # Verify hooks executed (use assert_receive with timeout for async operations)
-      assert_receive {:after_transaction_create_called, _id1}, 1000
-      assert_receive {:after_transaction_create_called, _id2}, 1000
-      assert_receive {:after_transaction_create_called, _id3}, 1000
+    ets do
+      private? true
     end
 
-    test "hooks work with return_stream? on failure" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
+    multitenancy do
+      strategy :attribute
+      attribute :org_id
+      global? true
+    end
 
-      # Create with invalid data to trigger failure
-      result_stream =
-        Ash.bulk_create(
-          [%{title: 1}, %{title: 2}],
-          Post,
-          :create_with_after_transaction,
-          tenant: org.id,
-          return_stream?: true,
-          return_errors?: true,
-          authorize?: false
-        )
+    actions do
+      default_accept :*
+      defaults [:read, :destroy]
 
-      # Consume the stream
-      results = Enum.to_list(result_stream)
-
-      # Each record should fail
-      for result <- results do
-        assert {:error, _} = result
+      create :create do
+        accept [:title, :title2, :org_id]
       end
 
-      # Verify hooks executed for each failed record
-      assert_receive {:error, _error}, 1000
-      assert_receive {:error, _error}, 1000
+      create :create_manual_with_after_transaction do
+        accept [:title, :title2, :org_id]
+        manual ManualCreateSimple
+        change ManualAfterTransactionChange
+      end
+
+      create :create_manual_with_after_transaction_converts_error do
+        accept [:title, :title2, :org_id]
+        manual ManualCreateFails
+        change ManualAfterTransactionConvertsErrorChange
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+
+      attribute :title, :string do
+        public?(true)
+        allow_nil?(false)
+      end
+
+      attribute :title2, :string do
+        public?(true)
+      end
+
+      attribute :org_id, :uuid do
+        public?(true)
+      end
+    end
+
+    relationships do
+      belongs_to :org, Org, public?: true, attribute_writable?: true
     end
   end
 
-  describe "after_transaction hooks basic functionality" do
+  describe "transaction: :batch" do
     test "hooks handle empty result set" do
       org =
         Org
@@ -700,9 +800,7 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       # Records are still created in the database
       assert length(Ash.read!(Post, tenant: org.id)) == 2
     end
-  end
 
-  describe "after_transaction hooks with transaction strategies" do
     test "hooks work with transaction: :batch (default) on success" do
       org =
         Org
@@ -729,60 +827,6 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert_receive {:after_transaction_create_called, _id3}, 1000
     end
 
-    test "hooks work with transaction: :all on success" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      result =
-        Ash.bulk_create!(
-          [%{title: "test1"}, %{title: "test2"}, %{title: "test3"}],
-          Post,
-          :create_with_after_transaction_hook,
-          tenant: org.id,
-          transaction: :all,
-          return_records?: true,
-          authorize?: false
-        )
-
-      assert result.status == :success
-      assert length(result.records) == 3
-
-      # Verify hooks executed for all records
-      assert_receive {:after_transaction_create_called, _id1}, 1000
-      assert_receive {:after_transaction_create_called, _id2}, 1000
-      assert_receive {:after_transaction_create_called, _id3}, 1000
-    end
-
-    test "hooks work with return_stream? and transaction: :batch" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      result_stream =
-        Ash.bulk_create(
-          [%{title: "test1"}, %{title: "test2"}],
-          Post,
-          :create_with_after_transaction_hook,
-          tenant: org.id,
-          return_stream?: true,
-          return_records?: true,
-          authorize?: false
-        )
-
-      # Consume the stream
-      results = Enum.to_list(result_stream)
-      assert length(results) == 2
-
-      # Verify hooks executed
-      assert_receive {:after_transaction_create_called, _id1}, 1000
-      assert_receive {:after_transaction_create_called, _id2}, 1000
-    end
-  end
-
-  describe "after_transaction hook return value for invalid changesets" do
     test "hook can convert validation error to success" do
       org =
         Org
@@ -840,118 +884,6 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       error = hd(result.errors)
       # The error should contain "custom error from hook", not the original "is required" error
       assert Exception.message(error) =~ "custom error from hook"
-    end
-
-    test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      # Create with a mix of valid and invalid data
-      # The invalid one's after_transaction hook should convert the error to success
-      # This tests the case where hook_success_results need to be properly handled
-      # when there are also valid changesets in the batch
-      result =
-        Ash.bulk_create(
-          [%{title: "valid_title"}, %{title: nil}],
-          Post,
-          :create_with_after_transaction_converts_error_to_success,
-          tenant: org.id,
-          transaction: :all,
-          return_records?: true,
-          return_errors?: true,
-          authorize?: false,
-          sorted?: true
-        )
-
-      # The hook should have been called for the invalid changeset
-      assert_receive {:after_transaction_converted_error_to_success}, 1000
-
-      # Both records should be returned - the valid one created normally,
-      # and the invalid one converted to success by the hook
-      assert result.status == :success
-      assert result.error_count == 0
-      assert length(result.records) == 2
-
-      # Verify both records are present
-      titles = Enum.map(result.records, & &1.title)
-      assert "valid_title" in titles
-      assert "default_from_hook" in titles
-    end
-
-    test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets (unsorted)" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      # Same test without sorted? to expose deeper issues with hook_success_results
-      # not being properly indexed for run_after_action_hooks
-      result =
-        Ash.bulk_create(
-          [%{title: "valid_title"}, %{title: nil}],
-          Post,
-          :create_with_after_transaction_converts_error_to_success,
-          tenant: org.id,
-          transaction: :all,
-          return_records?: true,
-          return_errors?: true,
-          authorize?: false
-        )
-
-      # The hook should have been called for the invalid changeset
-      assert_receive {:after_transaction_converted_error_to_success}, 1000
-
-      # Both records should be returned - the valid one created normally,
-      # and the invalid one converted to success by the hook
-      assert result.status == :success
-      assert result.error_count == 0
-      assert length(result.records) == 2
-
-      # Verify both records are present
-      titles = Enum.map(result.records, & &1.title)
-      assert "valid_title" in titles
-      assert "default_from_hook" in titles
-    end
-
-    test "after_action failure converted to success in run_batch with mixed valid/invalid" do
-      # This test exposes the bug where hook_success_results from after_action failures
-      # that are converted to success by after_transaction hooks are not properly handled
-      # when appended at line 1405 in run_batch. The changeset is not in changesets_by_ref
-      # because the indexes were rebuilt from valid changesets only.
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      # Create with a mix of valid and "fail_" prefixed titles
-      # The fail_ record will pass initial validation but fail in after_action,
-      # then be recovered by after_transaction
-      result =
-        Ash.bulk_create(
-          [%{title: "valid_title"}, %{title: "fail_this_one"}],
-          Post,
-          :create_with_after_action_failure_converted_to_success,
-          tenant: org.id,
-          transaction: :all,
-          return_records?: true,
-          return_errors?: true,
-          authorize?: false
-        )
-
-      # The after_transaction hook should have converted the after_action failure to success
-      assert_receive {:after_action_failed_converted_to_success}, 1000
-
-      # Both records should be returned
-      assert result.status == :success
-      assert result.error_count == 0
-      assert length(result.records) == 2
-
-      # Verify both records are present
-      titles = Enum.map(result.records, & &1.title)
-      assert "valid_title" in titles
-      assert "recovered_from_after_action_failure" in titles
     end
 
     test "after_action failure converted to success without transaction: :all" do
@@ -1075,10 +1007,8 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       titles = Enum.map(result.records, & &1.title)
       assert titles == ["first_valid", "default_from_hook", "third_valid"]
     end
-  end
 
-  describe "after_transaction hooks run outside batch transaction" do
-    setup do
+    test "after_transaction hooks run outside batch transaction - no warning" do
       capture_log(fn ->
         Ash.DataLayer.Mnesia.start(Domain, [MnesiaPost])
       end)
@@ -1088,36 +1018,6 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       |> Ash.read!()
       |> Enum.each(fn record -> Ash.destroy!(record) end)
 
-      :ok
-    end
-
-    test "after_action error with rollback_on_error? triggers rollback and after_transaction is NOT called" do
-      result =
-        [%{title: "title1"}, %{title: "title2"}]
-        |> Ash.bulk_create(
-          MnesiaPost,
-          :create_with_after_action_error_and_after_transaction,
-          transaction: :all,
-          rollback_on_error?: true,
-          return_errors?: true
-        )
-
-      # The after_action hook should have been called (it triggers the rollback)
-      assert_receive {:after_action_error_hook_called}
-
-      # The transaction was rolled back, returns a BulkResult with error status
-      assert %Ash.BulkResult{status: :error, errors: [error]} = result
-      assert %Ash.Error.Unknown.UnknownError{error: "\"after_action hook error\""} = error
-
-      # after_transaction hook is NOT called because we don't have access to
-      # the changesets after a transaction rollback
-      refute_receive {:after_transaction_called, _}
-
-      # No records should exist because the transaction was rolled back
-      assert [] == MnesiaPost |> Ash.read!()
-    end
-
-    test "after_transaction hooks run outside batch transaction - no warning" do
       # With transaction: :batch, after_transaction hooks now run OUTSIDE the transaction
       # so no warning should be logged
       log =
@@ -1143,9 +1043,7 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       # Should NOT warn since after_transaction now runs outside the transaction
       refute log =~ "after_transaction"
     end
-  end
 
-  describe "after_transaction exception handling" do
     test "exception in hook is caught and converted to error" do
       org =
         Org
@@ -1204,9 +1102,7 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert result.status == :error
       assert result.error_count == 3
     end
-  end
 
-  describe "after_transaction with stop_on_error? (default: true)" do
     test "hook returns error without return_stream? - error captured in result" do
       org =
         Org
@@ -1292,363 +1188,6 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       assert result.error_count == 1
       assert length(result.records) == 2
     end
-  end
-
-  defmodule ManualCreateSimple do
-    @moduledoc """
-    Simple manual create module that just performs the create.
-    After_transaction hooks are added via a separate change module.
-    """
-    use Ash.Resource.ManualCreate
-
-    def create(changeset, _opts, _context) do
-      # Perform the actual create using ETS data layer
-      Ash.DataLayer.Ets.create(changeset.resource, changeset)
-    end
-
-    def bulk_create(changesets, _opts, _context) do
-      Enum.map(changesets, fn changeset ->
-        case Ash.DataLayer.Ets.create(changeset.resource, changeset) do
-          {:ok, record} ->
-            record =
-              Ash.Resource.put_metadata(
-                record,
-                :bulk_create_index,
-                changeset.context.bulk_create.index
-              )
-
-            {:ok, record}
-
-          {:error, error} ->
-            {:error, error}
-        end
-      end)
-    end
-  end
-
-  defmodule ManualCreateFails do
-    @moduledoc """
-    Manual create module that always fails.
-    Used to test after_transaction hook error handling with manual actions.
-    """
-    use Ash.Resource.ManualCreate
-
-    def create(_changeset, _opts, _context) do
-      {:error, "intentional manual create error"}
-    end
-  end
-
-  defmodule ManualAfterTransactionChange do
-    @moduledoc """
-    Change module that adds after_transaction hook for manual action testing.
-    """
-    use Ash.Resource.Change
-
-    def change(changeset, _opts, _context) do
-      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
-        case result do
-          {:ok, record} ->
-            send(self(), {:manual_after_transaction_success, record.id})
-            {:ok, record}
-
-          {:error, error} ->
-            send(self(), {:manual_after_transaction_error, error})
-            {:error, error}
-        end
-      end)
-    end
-  end
-
-  defmodule ManualAfterTransactionConvertsErrorChange do
-    @moduledoc """
-    Change module that adds after_transaction hook that converts errors to success.
-    """
-    use Ash.Resource.Change
-
-    def change(changeset, _opts, _context) do
-      Ash.Changeset.after_transaction(changeset, fn _cs, result ->
-        case result do
-          {:ok, record} ->
-            {:ok, record}
-
-          {:error, _error} ->
-            send(self(), {:manual_after_transaction_converted_error})
-            # Return a fake success
-            {:ok, %{changeset.data | id: Ash.UUID.generate(), title: "manual_recovered"}}
-        end
-      end)
-    end
-  end
-
-  defmodule ManualPost do
-    @moduledoc false
-    use Ash.Resource,
-      domain: Domain,
-      data_layer: Ash.DataLayer.Ets,
-      notifiers: [Notifier]
-
-    alias Ash.Test.Actions.BulkCreateAfterTransactionTest.{
-      Org,
-      ManualCreateSimple,
-      ManualCreateFails,
-      ManualAfterTransactionChange,
-      ManualAfterTransactionConvertsErrorChange
-    }
-
-    ets do
-      private? true
-    end
-
-    multitenancy do
-      strategy :attribute
-      attribute :org_id
-      global? true
-    end
-
-    actions do
-      default_accept :*
-      defaults [:read, :destroy]
-
-      create :create do
-        accept [:title, :title2, :org_id]
-      end
-
-      create :create_manual_with_after_transaction do
-        accept [:title, :title2, :org_id]
-        manual ManualCreateSimple
-        change ManualAfterTransactionChange
-      end
-
-      create :create_manual_with_after_transaction_converts_error do
-        accept [:title, :title2, :org_id]
-        manual ManualCreateFails
-        change ManualAfterTransactionConvertsErrorChange
-      end
-    end
-
-    attributes do
-      uuid_primary_key :id
-
-      attribute :title, :string do
-        public?(true)
-        allow_nil?(false)
-      end
-
-      attribute :title2, :string do
-        public?(true)
-      end
-
-      attribute :org_id, :uuid do
-        public?(true)
-      end
-    end
-
-    relationships do
-      belongs_to :org, Org, public?: true, attribute_writable?: true
-    end
-  end
-
-  describe "after_transaction with manual actions" do
-    test "after_transaction hooks work with manual action (single record)" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      result =
-        Ash.bulk_create!(
-          [%{title: "manual_test_1"}],
-          ManualPost,
-          :create_manual_with_after_transaction,
-          tenant: org.id,
-          return_records?: true
-        )
-
-      assert result.status == :success
-      assert length(result.records) == 1
-
-      # Verify after_transaction hook was called
-      assert_receive {:manual_after_transaction_success, _id}, 1000
-    end
-
-    test "after_transaction hooks work with manual action (multiple records)" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      result =
-        Ash.bulk_create!(
-          [%{title: "manual_bulk_1"}, %{title: "manual_bulk_2"}, %{title: "manual_bulk_3"}],
-          ManualPost,
-          :create_manual_with_after_transaction,
-          tenant: org.id,
-          return_records?: true
-        )
-
-      assert result.status == :success
-      assert length(result.records) == 3
-
-      # Verify after_transaction hooks were called for all records
-      assert_receive {:manual_after_transaction_success, _id1}, 1000
-      assert_receive {:manual_after_transaction_success, _id2}, 1000
-      assert_receive {:manual_after_transaction_success, _id3}, 1000
-    end
-
-    test "after_transaction hook can convert error to success in manual action" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      result =
-        Ash.bulk_create(
-          [%{title: "will_fail"}],
-          ManualPost,
-          :create_manual_with_after_transaction_converts_error,
-          tenant: org.id,
-          return_records?: true,
-          return_errors?: true
-        )
-
-      # The hook should have been called
-      assert_receive {:manual_after_transaction_converted_error}, 1000
-
-      # The result should show success (error converted by hook)
-      assert result.status == :success
-      assert length(result.records) == 1
-      assert hd(result.records).title == "manual_recovered"
-    end
-
-    test "manual action after_transaction hooks work with return_stream?" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      result_stream =
-        Ash.bulk_create(
-          [%{title: "stream_manual_1"}, %{title: "stream_manual_2"}],
-          ManualPost,
-          :create_manual_with_after_transaction,
-          tenant: org.id,
-          return_stream?: true,
-          return_records?: true
-        )
-
-      results = Enum.to_list(result_stream)
-      assert length(results) == 2
-
-      # Verify hooks executed
-      assert_receive {:manual_after_transaction_success, _id1}, 1000
-      assert_receive {:manual_after_transaction_success, _id2}, 1000
-    end
-
-    test "manual action after_transaction hooks work with transaction: :all" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      result =
-        Ash.bulk_create!(
-          [%{title: "tx_all_manual_1"}, %{title: "tx_all_manual_2"}],
-          ManualPost,
-          :create_manual_with_after_transaction,
-          tenant: org.id,
-          transaction: :all,
-          return_records?: true
-        )
-
-      assert result.status == :success
-      assert length(result.records) == 2
-
-      # Verify hooks executed
-      assert_receive {:manual_after_transaction_success, _id1}, 1000
-      assert_receive {:manual_after_transaction_success, _id2}, 1000
-    end
-  end
-
-  describe "after_transaction with load option" do
-    test "load option with return_stream? and after_transaction hooks" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      # Create an author to reference
-      author =
-        Author
-        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
-        |> Ash.create!()
-
-      result_stream =
-        Ash.bulk_create(
-          [
-            %{title: "load_stream_1", author_id: author.id},
-            %{title: "load_stream_2", author_id: author.id}
-          ],
-          Post,
-          :create_with_after_transaction_hook,
-          tenant: org.id,
-          return_stream?: true,
-          return_records?: true,
-          load: [:author],
-          authorize?: false
-        )
-
-      results = Enum.to_list(result_stream)
-      assert length(results) == 2
-
-      # Verify hooks executed
-      assert_receive {:after_transaction_create_called, _id1}, 1000
-      assert_receive {:after_transaction_create_called, _id2}, 1000
-
-      # Verify author relationship is loaded
-      for {:ok, record} <- results do
-        assert %Author{name: "Test Author"} = record.author
-      end
-    end
-
-    test "load option with transaction: :all and after_transaction hooks" do
-      org =
-        Org
-        |> Ash.Changeset.for_create(:create, %{})
-        |> Ash.create!()
-
-      # Create an author to reference
-      author =
-        Author
-        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
-        |> Ash.create!()
-
-      result =
-        Ash.bulk_create!(
-          [
-            %{title: "load_tx_all_1", author_id: author.id},
-            %{title: "load_tx_all_2", author_id: author.id}
-          ],
-          Post,
-          :create_with_after_transaction_hook,
-          tenant: org.id,
-          transaction: :all,
-          return_records?: true,
-          load: [:author],
-          authorize?: false
-        )
-
-      assert result.status == :success
-      assert length(result.records) == 2
-
-      # Verify hooks executed
-      assert_receive {:after_transaction_create_called, _id1}, 1000
-      assert_receive {:after_transaction_create_called, _id2}, 1000
-
-      # Verify author relationship is loaded
-      for record <- result.records do
-        assert %Author{name: "Test Author"} = record.author
-      end
-    end
 
     test "load option with transaction: :batch (default) and after_transaction hooks" do
       org =
@@ -1691,7 +1230,349 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
     end
   end
 
-  describe "after_transaction with upsert" do
+  describe "transaction: :all" do
+    test "hooks work with transaction: :all on success" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create!(
+          [%{title: "test1"}, %{title: "test2"}, %{title: "test3"}],
+          Post,
+          :create_with_after_transaction_hook,
+          tenant: org.id,
+          transaction: :all,
+          return_records?: true,
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Verify hooks executed for all records
+      assert_receive {:after_transaction_create_called, _id1}, 1000
+      assert_receive {:after_transaction_create_called, _id2}, 1000
+      assert_receive {:after_transaction_create_called, _id3}, 1000
+    end
+
+    test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create with a mix of valid and invalid data
+      # The invalid one's after_transaction hook should convert the error to success
+      # This tests the case where hook_success_results need to be properly handled
+      # when there are also valid changesets in the batch
+      result =
+        Ash.bulk_create(
+          [%{title: "valid_title"}, %{title: nil}],
+          Post,
+          :create_with_after_transaction_converts_error_to_success,
+          tenant: org.id,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true,
+          authorize?: false,
+          sorted?: true
+        )
+
+      # The hook should have been called for the invalid changeset
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # Both records should be returned - the valid one created normally,
+      # and the invalid one converted to success by the hook
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+
+      # Verify both records are present
+      titles = Enum.map(result.records, & &1.title)
+      assert "valid_title" in titles
+      assert "default_from_hook" in titles
+    end
+
+    test "hook can convert error to success with transaction: :all and mixed valid/invalid changesets (unsorted)" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Same test without sorted? to expose deeper issues with hook_success_results
+      # not being properly indexed for run_after_action_hooks
+      result =
+        Ash.bulk_create(
+          [%{title: "valid_title"}, %{title: nil}],
+          Post,
+          :create_with_after_transaction_converts_error_to_success,
+          tenant: org.id,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true,
+          authorize?: false
+        )
+
+      # The hook should have been called for the invalid changeset
+      assert_receive {:after_transaction_converted_error_to_success}, 1000
+
+      # Both records should be returned - the valid one created normally,
+      # and the invalid one converted to success by the hook
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+
+      # Verify both records are present
+      titles = Enum.map(result.records, & &1.title)
+      assert "valid_title" in titles
+      assert "default_from_hook" in titles
+    end
+
+    test "after_action failure converted to success in run_batch with mixed valid/invalid" do
+      # This test exposes the bug where hook_success_results from after_action failures
+      # that are converted to success by after_transaction hooks are not properly handled
+      # when appended at line 1405 in run_batch. The changeset is not in changesets_by_ref
+      # because the indexes were rebuilt from valid changesets only.
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create with a mix of valid and "fail_" prefixed titles
+      # The fail_ record will pass initial validation but fail in after_action,
+      # then be recovered by after_transaction
+      result =
+        Ash.bulk_create(
+          [%{title: "valid_title"}, %{title: "fail_this_one"}],
+          Post,
+          :create_with_after_action_failure_converted_to_success,
+          tenant: org.id,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true,
+          authorize?: false
+        )
+
+      # The after_transaction hook should have converted the after_action failure to success
+      assert_receive {:after_action_failed_converted_to_success}, 1000
+
+      # Both records should be returned
+      assert result.status == :success
+      assert result.error_count == 0
+      assert length(result.records) == 2
+
+      # Verify both records are present
+      titles = Enum.map(result.records, & &1.title)
+      assert "valid_title" in titles
+      assert "recovered_from_after_action_failure" in titles
+    end
+
+    test "after_action error with rollback_on_error? triggers rollback and after_transaction is NOT called" do
+      capture_log(fn ->
+        Ash.DataLayer.Mnesia.start(Domain, [MnesiaPost])
+      end)
+
+      # Clean up any existing records to ensure test isolation
+      MnesiaPost
+      |> Ash.read!()
+      |> Enum.each(fn record -> Ash.destroy!(record) end)
+
+      result =
+        [%{title: "title1"}, %{title: "title2"}]
+        |> Ash.bulk_create(
+          MnesiaPost,
+          :create_with_after_action_error_and_after_transaction,
+          transaction: :all,
+          rollback_on_error?: true,
+          return_errors?: true
+        )
+
+      # The after_action hook should have been called (it triggers the rollback)
+      assert_receive {:after_action_error_hook_called}
+
+      # The transaction was rolled back, returns a BulkResult with error status
+      assert %Ash.BulkResult{status: :error, errors: [error]} = result
+      assert %Ash.Error.Unknown.UnknownError{error: "\"after_action hook error\""} = error
+
+      # after_transaction hook is NOT called because we don't have access to
+      # the changesets after a transaction rollback
+      refute_receive {:after_transaction_called, _}
+
+      # No records should exist because the transaction was rolled back
+      assert [] == MnesiaPost |> Ash.read!()
+    end
+
+    test "load option with transaction: :all and after_transaction hooks" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create an author to reference
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create!(
+          [
+            %{title: "load_tx_all_1", author_id: author.id},
+            %{title: "load_tx_all_2", author_id: author.id}
+          ],
+          Post,
+          :create_with_after_transaction_hook,
+          tenant: org.id,
+          transaction: :all,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 2
+
+      # Verify hooks executed
+      assert_receive {:after_transaction_create_called, _id1}, 1000
+      assert_receive {:after_transaction_create_called, _id2}, 1000
+
+      # Verify author relationship is loaded
+      for record <- result.records do
+        assert %Author{name: "Test Author"} = record.author
+      end
+    end
+  end
+
+  describe "return_stream?" do
+    test "hooks work with return_stream?" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # return_stream?: true streams results back
+      result_stream =
+        Ash.bulk_create(
+          [%{title: "title1"}, %{title: "title2"}, %{title: "title3"}],
+          Post,
+          :create_with_after_transaction_hook,
+          tenant: org.id,
+          return_stream?: true,
+          return_records?: true,
+          authorize?: false
+        )
+
+      # Consume the stream
+      results = Enum.to_list(result_stream)
+      assert length(results) == 3
+
+      # Verify hooks executed (use assert_receive with timeout for async operations)
+      assert_receive {:after_transaction_create_called, _id1}, 1000
+      assert_receive {:after_transaction_create_called, _id2}, 1000
+      assert_receive {:after_transaction_create_called, _id3}, 1000
+    end
+
+    test "hooks work with return_stream? on failure" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create with invalid data to trigger failure
+      result_stream =
+        Ash.bulk_create(
+          [%{title: 1}, %{title: 2}],
+          Post,
+          :create_with_after_transaction,
+          tenant: org.id,
+          return_stream?: true,
+          return_errors?: true,
+          authorize?: false
+        )
+
+      # Consume the stream
+      results = Enum.to_list(result_stream)
+
+      # Each record should fail
+      for result <- results do
+        assert {:error, _} = result
+      end
+
+      # Verify hooks executed for each failed record
+      assert_receive {:error, _error}, 1000
+      assert_receive {:error, _error}, 1000
+    end
+
+    test "hooks work with return_stream? and transaction: :batch" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result_stream =
+        Ash.bulk_create(
+          [%{title: "test1"}, %{title: "test2"}],
+          Post,
+          :create_with_after_transaction_hook,
+          tenant: org.id,
+          return_stream?: true,
+          return_records?: true,
+          authorize?: false
+        )
+
+      # Consume the stream
+      results = Enum.to_list(result_stream)
+      assert length(results) == 2
+
+      # Verify hooks executed
+      assert_receive {:after_transaction_create_called, _id1}, 1000
+      assert_receive {:after_transaction_create_called, _id2}, 1000
+    end
+
+    test "load option with return_stream? and after_transaction hooks" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      # Create an author to reference
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      result_stream =
+        Ash.bulk_create(
+          [
+            %{title: "load_stream_1", author_id: author.id},
+            %{title: "load_stream_2", author_id: author.id}
+          ],
+          Post,
+          :create_with_after_transaction_hook,
+          tenant: org.id,
+          return_stream?: true,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      results = Enum.to_list(result_stream)
+      assert length(results) == 2
+
+      # Verify hooks executed
+      assert_receive {:after_transaction_create_called, _id1}, 1000
+      assert_receive {:after_transaction_create_called, _id2}, 1000
+
+      # Verify author relationship is loaded
+      for {:ok, record} <- results do
+        assert %Author{name: "Test Author"} = record.author
+      end
+    end
+  end
+
+  describe "upsert" do
     test "hooks execute on successful upsert insert" do
       org =
         Org
@@ -1846,6 +1727,127 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       # For skipped upserts with return_skipped_upsert?: true,
       # the after_transaction hook IS called with the existing record
       assert_receive {:upsert_skipped_after_transaction_called, _, "return_skip_test"}, 1000
+    end
+  end
+
+  describe "manual actions" do
+    test "after_transaction hooks work with manual action (single record)" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create!(
+          [%{title: "manual_test_1"}],
+          ManualPost,
+          :create_manual_with_after_transaction,
+          tenant: org.id,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+
+      # Verify after_transaction hook was called
+      assert_receive {:manual_after_transaction_success, _id}, 1000
+    end
+
+    test "after_transaction hooks work with manual action (multiple records)" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create!(
+          [%{title: "manual_bulk_1"}, %{title: "manual_bulk_2"}, %{title: "manual_bulk_3"}],
+          ManualPost,
+          :create_manual_with_after_transaction,
+          tenant: org.id,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 3
+
+      # Verify after_transaction hooks were called for all records
+      assert_receive {:manual_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_after_transaction_success, _id2}, 1000
+      assert_receive {:manual_after_transaction_success, _id3}, 1000
+    end
+
+    test "after_transaction hook can convert error to success in manual action" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create(
+          [%{title: "will_fail"}],
+          ManualPost,
+          :create_manual_with_after_transaction_converts_error,
+          tenant: org.id,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # The hook should have been called
+      assert_receive {:manual_after_transaction_converted_error}, 1000
+
+      # The result should show success (error converted by hook)
+      assert result.status == :success
+      assert length(result.records) == 1
+      assert hd(result.records).title == "manual_recovered"
+    end
+
+    test "manual action after_transaction hooks work with return_stream?" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result_stream =
+        Ash.bulk_create(
+          [%{title: "stream_manual_1"}, %{title: "stream_manual_2"}],
+          ManualPost,
+          :create_manual_with_after_transaction,
+          tenant: org.id,
+          return_stream?: true,
+          return_records?: true
+        )
+
+      results = Enum.to_list(result_stream)
+      assert length(results) == 2
+
+      # Verify hooks executed
+      assert_receive {:manual_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_after_transaction_success, _id2}, 1000
+    end
+
+    test "manual action after_transaction hooks work with transaction: :all" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create!(
+          [%{title: "tx_all_manual_1"}, %{title: "tx_all_manual_2"}],
+          ManualPost,
+          :create_manual_with_after_transaction,
+          tenant: org.id,
+          transaction: :all,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 2
+
+      # Verify hooks executed
+      assert_receive {:manual_after_transaction_success, _id1}, 1000
+      assert_receive {:manual_after_transaction_success, _id2}, 1000
     end
   end
 end

@@ -310,74 +310,7 @@ defmodule Ash.Actions.Update.Bulk do
           else
             {:ok, do_atomic_update(query, atomic_changeset, has_after_batch_hooks?, input, opts)}
           end
-          |> case do
-            {:ok, bulk_result} ->
-              bulk_result =
-                if Enum.empty?(atomic_changeset.after_transaction) do
-                  bulk_result
-                else
-                  {processed_records, errors} =
-                    Enum.reduce(
-                      bulk_result.records,
-                      {[], []},
-                      fn result, {records, errors} ->
-                        case Ash.Changeset.run_after_transactions({:ok, result}, atomic_changeset) do
-                          {:ok, result} ->
-                            {[result | records], errors}
-
-                          {:error, error} ->
-                            {records, [error | errors]}
-                        end
-                      end
-                    )
-
-                  %{
-                    bulk_result
-                    | records: Enum.reverse(processed_records),
-                      errors: bulk_result.errors ++ Enum.reverse(errors),
-                      error_count: bulk_result.error_count + length(errors)
-                  }
-                  |> Ash.BulkResult.recalculate_status()
-                end
-
-              if opts[:return_notifications?] do
-                bulk_result
-              else
-                if notify? do
-                  notifications =
-                    List.wrap(Process.delete(:ash_notifications)) ++
-                      List.wrap(bulk_result.notifications)
-
-                  if opts[:notify?] do
-                    remaining_notifications = Ash.Notifier.notify(notifications)
-
-                    Ash.Actions.Helpers.warn_missed!(atomic_changeset.resource, action, %{
-                      resource_notifications: remaining_notifications
-                    })
-
-                    %{bulk_result | notifications: notifications}
-                  else
-                    %{bulk_result | notifications: []}
-                  end
-                else
-                  process_notifications = List.wrap(Process.get(:ash_notifications, []))
-
-                  Process.put(
-                    :ash_notifications,
-                    process_notifications ++ List.wrap(bulk_result.notifications)
-                  )
-
-                  %{bulk_result | notifications: []}
-                end
-              end
-
-            {:error, error} ->
-              %Ash.BulkResult{
-                status: :error,
-                errors: [Ash.Error.to_ash_error(error)],
-                error_count: 1
-              }
-          end
+          |> process_atomic_result(atomic_changeset, action, notify?, opts)
         after
           if notify? do
             Process.delete(:ash_started_transaction?)
@@ -575,7 +508,6 @@ defmodule Ash.Actions.Update.Bulk do
               __STACKTRACE__
   end
 
-  # TODO: we need to also split this up and do the load after the transaction and run after_transaction hooks in between
   defp do_atomic_update(query, atomic_changeset, has_after_batch_hooks?, input, opts) do
     context =
       struct(
@@ -782,30 +714,9 @@ defmodule Ash.Actions.Update.Bulk do
               end)
             end
 
-          {results, errors, error_count} =
-            case load_data(
-                   results,
-                   atomic_changeset.domain,
-                   atomic_changeset.resource,
-                   atomic_changeset,
-                   opts
-                 ) do
-              {:ok, results} ->
-                {results, errors, error_count}
-
-              {:error, error} ->
-                {[], errors ++ List.wrap(error), error_count + Enum.count(List.wrap(error))}
-            end
-
-          notifications =
-            if opts[:notify?] do
-              notifications ++
-                Enum.map(results, fn result ->
-                  notification(atomic_changeset, result, opts)
-                end)
-            else
-              notifications
-            end
+          # Note: load_data and per-record notification building have been moved to
+          # process_atomic_result which runs after_transaction hooks first, then loads,
+          # ensuring loaded data reflects any modifications made by after_transaction hooks.
 
           status =
             case {error_count, results} do
@@ -1017,7 +928,184 @@ defmodule Ash.Actions.Update.Bulk do
     end
   end
 
-  defp validate_multitenancy(resource, action, opts) do
+  # Processes the result of do_atomic_update, running after_transaction hooks,
+  # loading data, and handling notifications. This ensures:
+  # 1. after_transaction hooks run for both success and error cases
+  # 2. load_data runs AFTER hooks (so loaded data reflects hook modifications)
+  # 3. Notifications are built from the final loaded records
+  defp process_atomic_result(result, atomic_changeset, action, notify?, opts)
+
+  defp process_atomic_result(
+         {:ok, %Ash.BulkResult{} = bulk_result},
+         atomic_changeset,
+         action,
+         notify?,
+         opts
+       ) do
+    # Apply load and select options to changeset (needed because apply_opts_load and select
+    # are called inside do_atomic_update but those are local rebindings, so the changeset
+    # passed here doesn't have them)
+    atomic_changeset = Ash.Actions.Helpers.apply_opts_load(atomic_changeset, opts)
+
+    atomic_changeset =
+      if opts[:select] do
+        Ash.Changeset.select(atomic_changeset, opts[:select])
+      else
+        atomic_changeset
+      end
+
+    # Run after_transaction for each record
+    {processed_records, hook_errors} =
+      if Enum.empty?(atomic_changeset.after_transaction) do
+        {bulk_result.records, []}
+      else
+        Enum.reduce(bulk_result.records, {[], []}, fn result, {records, errors} ->
+          case Ash.Changeset.run_after_transactions({:ok, result}, atomic_changeset) do
+            {:ok, result} -> {[result | records], errors}
+            {:error, error} -> {records, [error | errors]}
+          end
+        end)
+        |> then(fn {records, errors} -> {Enum.reverse(records), Enum.reverse(errors)} end)
+      end
+
+    # Load data AFTER hooks (so loaded data reflects hook modifications)
+    {loaded_records, load_errors} =
+      case load_data(
+             processed_records,
+             atomic_changeset.domain,
+             atomic_changeset.resource,
+             atomic_changeset,
+             opts
+           ) do
+        {:ok, records} -> {List.wrap(records), []}
+        {:error, error} -> {[], [error]}
+      end
+
+    # Build notifications for successfully loaded records
+    final_notifications =
+      if opts[:notify?] do
+        List.wrap(bulk_result.notifications) ++
+          Enum.map(loaded_records, &notification(atomic_changeset, &1, opts))
+      else
+        List.wrap(bulk_result.notifications)
+      end
+
+    # Combine all errors and build final result
+    all_errors = List.wrap(bulk_result.errors) ++ hook_errors ++ load_errors
+
+    %Ash.BulkResult{
+      bulk_result
+      | records:
+          if opts[:return_records?] do
+            loaded_records
+          else
+            []
+          end,
+        errors: all_errors,
+        error_count: bulk_result.error_count + length(hook_errors) + length(load_errors),
+        notifications: final_notifications
+    }
+    |> Ash.BulkResult.recalculate_status()
+    |> handle_atomic_notifications(atomic_changeset.resource, action, notify?, opts)
+  end
+
+  defp process_atomic_result({:error, error}, atomic_changeset, action, notify?, opts) do
+    # Apply load and select options to changeset (same as success path)
+    atomic_changeset = Ash.Actions.Helpers.apply_opts_load(atomic_changeset, opts)
+
+    atomic_changeset =
+      if opts[:select] do
+        Ash.Changeset.select(atomic_changeset, opts[:select])
+      else
+        atomic_changeset
+      end
+
+    # Run after_transaction with error - hook may convert to success
+    case Ash.Changeset.run_after_transactions({:error, error}, atomic_changeset) do
+      {:ok, result} ->
+        # Hook converted error to success - need to load and return
+        case load_data(
+               [result],
+               atomic_changeset.domain,
+               atomic_changeset.resource,
+               atomic_changeset,
+               opts
+             ) do
+          {:ok, [loaded]} ->
+            notifications =
+              if opts[:notify?], do: [notification(atomic_changeset, loaded, opts)], else: []
+
+            %Ash.BulkResult{
+              status: :success,
+              records:
+                if opts[:return_records?] do
+                  [loaded]
+                else
+                  []
+                end,
+              errors: [],
+              error_count: 0,
+              notifications: notifications
+            }
+            |> handle_atomic_notifications(atomic_changeset.resource, action, notify?, opts)
+
+          {:ok, []} ->
+            %Ash.BulkResult{status: :success, records: [], errors: [], error_count: 0}
+
+          {:error, load_error} ->
+            %Ash.BulkResult{
+              status: :error,
+              records: [],
+              errors: [load_error],
+              error_count: 1
+            }
+        end
+
+      {:error, final_error} ->
+        %Ash.BulkResult{
+          status: :error,
+          records: [],
+          errors: [Ash.Error.to_ash_error(final_error)],
+          error_count: 1
+        }
+    end
+  end
+
+  # Helper for notification dispatch (extracted from inline code for reuse)
+  defp handle_atomic_notifications(bulk_result, resource, action, notify?, opts) do
+    if opts[:return_notifications?] do
+      bulk_result
+    else
+      if notify? do
+        notifications =
+          List.wrap(Process.delete(:ash_notifications)) ++
+            List.wrap(bulk_result.notifications)
+
+        if opts[:notify?] do
+          remaining = Ash.Notifier.notify(notifications)
+
+          Ash.Actions.Helpers.warn_missed!(resource, action, %{
+            resource_notifications: remaining
+          })
+
+          %{bulk_result | notifications: notifications}
+        else
+          %{bulk_result | notifications: []}
+        end
+      else
+        process_notifications = List.wrap(Process.get(:ash_notifications, []))
+
+        Process.put(
+          :ash_notifications,
+          process_notifications ++ List.wrap(bulk_result.notifications)
+        )
+
+        %{bulk_result | notifications: []}
+      end
+    end
+  end
+
+  defp validate_multitenancy(resource, opts) do
     if Ash.Resource.Info.multitenancy_strategy(resource) &&
          !Ash.Resource.Info.multitenancy_global?(resource) && !opts[:tenant] &&
          Map.get(action, :multitenancy) not in [:bypass, :bypass_all, :allow_global] &&

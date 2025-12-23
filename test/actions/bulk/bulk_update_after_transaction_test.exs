@@ -35,6 +35,24 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
     end
   end
 
+  defmodule AtomicWithAfterTransactionModifiesResult do
+    @moduledoc """
+    Change module that modifies the result in after_transaction and supports atomic.
+    Used to test that load happens AFTER after_transaction hooks.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        {:ok, %{result | title: result.title <> "_modified_by_hook"}}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
   defmodule AtomicUpdateWithAfterTransactionHandlingErrors do
     @moduledoc """
     Change module that adds after_transaction hooks that handle both success and failure.
@@ -404,6 +422,10 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
 
       update :update_with_atomic_after_transaction do
         change AtomicWithAfterTransaction
+      end
+
+      update :update_with_atomic_after_transaction_modifying_result do
+        change AtomicWithAfterTransactionModifiesResult
       end
 
       update :update_with_atomic_upgrade_and_after_transaction do
@@ -1024,6 +1046,43 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
 
       # Hook should still work after fallback
       assert_receive {:atomic_upgrade_after_transaction_called, _id}, 1000
+    end
+
+    test "load reflects modifications from after_transaction hook" do
+      # Create an author and post
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "Test Author"})
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "original", author_id: author.id})
+        |> Ash.create!()
+
+      # Use action that modifies the result in after_transaction
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update!(
+          :update_with_atomic_after_transaction_modifying_result,
+          %{},
+          strategy: :atomic,
+          return_records?: true,
+          load: [:author],
+          authorize?: false
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+      [updated_post] = result.records
+
+      # The after_transaction hook appends "_modified_by_hook" to the title
+      # This verifies that load happens AFTER after_transaction hooks
+      assert updated_post.title == "original_modified_by_hook"
+
+      # Load should still work correctly
+      assert updated_post.author.name == "Test Author"
     end
   end
 
@@ -2014,10 +2073,9 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
       end
     end
 
-    # TODO: This behavior is inconsistent with non-atomic strategies where load reflects the final result.
-    #       The atomic path runs load_data BEFORE after_transaction hooks, so loaded data doesn't
-    #       reflect modifications made by hooks. See TODO at bulk.ex around line 578.
-    test "hook modifying result - load reflects original data" do
+    # Note: This tests the correct behavior where load happens AFTER after_transaction hooks,
+    # so loaded data reflects modifications made by hooks.
+    test "hook modifying result - load reflects modified data" do
       # Create an author and post
       author =
         Author

@@ -335,28 +335,55 @@ defmodule Ash.Actions.Destroy.Bulk do
                 if Enum.empty?(atomic_changeset.after_transaction) do
                   bulk_result
                 else
-                  {processed_records, errors} =
-                    Enum.reduce(
-                      bulk_result.records,
-                      {[], []},
-                      fn result, {records, errors} ->
-                        case Ash.Changeset.run_after_transactions({:ok, result}, atomic_changeset) do
-                          {:ok, result} ->
-                            {[result | records], errors}
+                  # Only process records if we have them (not nil/empty from error status)
+                  if bulk_result.status == :error || is_nil(bulk_result.records) do
+                    # Run after_transaction hooks with the error for error results
+                    case Ash.Changeset.run_after_transactions(
+                           {:error,
+                            Ash.Error.to_ash_error(
+                              bulk_result.errors |> List.first() || "Unknown error"
+                            )},
+                           atomic_changeset
+                         ) do
+                      {:ok, result} ->
+                        %{
+                          bulk_result
+                          | status: :success,
+                            records: [result],
+                            errors: [],
+                            error_count: 0
+                        }
 
-                          {:error, error} ->
-                            {records, [error | errors]}
+                      {:error, error} ->
+                        %{bulk_result | errors: [error], error_count: 1}
+                    end
+                  else
+                    {processed_records, errors} =
+                      Enum.reduce(
+                        bulk_result.records,
+                        {[], []},
+                        fn result, {records, errors} ->
+                          case Ash.Changeset.run_after_transactions(
+                                 {:ok, result},
+                                 atomic_changeset
+                               ) do
+                            {:ok, result} ->
+                              {[result | records], errors}
+
+                            {:error, error} ->
+                              {records, [error | errors]}
+                          end
                         end
-                      end
-                    )
+                      )
 
-                  %{
-                    bulk_result
-                    | records: Enum.reverse(processed_records),
-                      errors: bulk_result.errors ++ Enum.reverse(errors),
-                      error_count: bulk_result.error_count + length(errors)
-                  }
-                  |> Ash.BulkResult.recalculate_status()
+                    %{
+                      bulk_result
+                      | records: Enum.reverse(processed_records),
+                        errors: bulk_result.errors ++ Enum.reverse(errors),
+                        error_count: bulk_result.error_count + length(errors)
+                    }
+                    |> Ash.BulkResult.recalculate_status()
+                  end
                 end
 
               if opts[:return_notifications?] do

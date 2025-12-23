@@ -228,6 +228,40 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
     end
   end
 
+  defmodule AtomicValidationFailsInTransaction do
+    @moduledoc """
+    Validation that fails when title == "fail_in_tx".
+    For atomic strategies, uses the atomic/3 callback to check condition DURING transaction.
+    For stream strategy, uses validate/3 callback to check condition.
+    """
+    use Ash.Resource.Validation
+
+    @impl true
+    def validate(changeset, _opts, _context) do
+      # For stream strategy - check the condition on the changeset
+      new_title = Ash.Changeset.get_attribute(changeset, :title)
+
+      if new_title == "fail_in_tx" do
+        {:error, field: :title, message: "atomic validation failed in transaction"}
+      else
+        :ok
+      end
+    end
+
+    @impl true
+    def atomic(_changeset, _opts, _context) do
+      # Condition checked DURING transaction - fails when NEW title value == "fail_in_tx"
+      # Use atomic_ref(:title) to reference the new value being set
+      {:atomic, [:title], expr(^atomic_ref(:title) == "fail_in_tx"),
+       expr(
+         error(Ash.Error.Changes.InvalidAttribute, %{
+           field: :title,
+           message: "atomic validation failed in transaction"
+         })
+       )}
+    end
+  end
+
   defmodule AddAfterTransactionDuringPending do
     @moduledoc """
     This change adds an after_transaction hook and supports atomic execution.
@@ -466,6 +500,11 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
 
       update :update_with_stop_on_error_hook do
         change AfterTransactionWithStopOnError
+      end
+
+      update :update_with_atomic_validation_in_transaction do
+        validate AtomicValidationFailsInTransaction
+        change AtomicUpdateWithAfterTransactionHandlingErrors
       end
     end
 
@@ -2315,6 +2354,59 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
     end
   end
 
+  defmodule PolicyPost do
+    @moduledoc """
+    Resource with policies for testing forbidden error scenarios.
+    Reading is allowed for everyone, but updating is forbidden unless actor has allow: true.
+    This allows stream strategy to query records but fail on update.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Ets,
+      authorizers: [Ash.Policy.Authorizer]
+
+    ets do
+      private? true
+    end
+
+    policies do
+      # Allow reading for everyone (so stream can query records)
+      policy action_type(:read) do
+        authorize_if always()
+      end
+
+      # Allow creating without actor for test setup
+      policy action_type(:create) do
+        authorize_if always()
+      end
+
+      # Forbid update unless actor has allow: true
+      policy action_type(:update) do
+        forbid_unless actor_attribute_equals(:allow, true)
+      end
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, :destroy, create: :*]
+
+      update :update do
+        accept [:title]
+        primary? true
+      end
+
+      update :update_with_after_transaction do
+        accept [:title]
+        change AtomicUpdateWithAfterTransactionHandlingErrors
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string, allow_nil?: false, public?: true
+    end
+  end
+
   describe "manual actions" do
     test "hooks work with single record" do
       post =
@@ -2450,6 +2542,193 @@ defmodule Ash.Test.Actions.BulkUpdateAfterTransactionTest do
       # Verify hooks executed
       assert_receive {:manual_update_after_transaction_success, _id1}, 1000
       assert_receive {:manual_update_after_transaction_success, _id2}, 1000
+    end
+  end
+
+  describe "forbidden errors" do
+    test "after_transaction hook is called on forbidden error with :atomic strategy" do
+      # Create a record without authorization
+      post =
+        PolicyPost
+        |> Ash.Changeset.for_create(:create, %{title: "forbidden_test"})
+        |> Ash.create!(authorize?: false)
+
+      # Try to update with authorization - should be forbidden
+      result =
+        PolicyPost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(:update_with_after_transaction, %{title: "updated"},
+          strategy: :atomic,
+          authorize?: true,
+          actor: %{allow: false},
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the forbidden error
+      assert_receive {:after_transaction_update_error, error}, 1000
+      assert %Ash.Error.Forbidden{} = error
+    end
+
+    test "after_transaction hook is called on forbidden error with :atomic_batches strategy" do
+      # Create records without authorization
+      posts =
+        for i <- 1..3 do
+          PolicyPost
+          |> Ash.Changeset.for_create(:create, %{title: "forbidden_batch_#{i}"})
+          |> Ash.create!(authorize?: false)
+        end
+
+      # Try to update with authorization - should be forbidden
+      result =
+        posts
+        |> Ash.bulk_update(:update_with_after_transaction, %{title: "updated"},
+          strategy: :atomic_batches,
+          batch_size: 2,
+          authorize?: true,
+          actor: %{allow: false},
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the forbidden error
+      assert_receive {:after_transaction_update_error, error}, 1000
+      assert %Ash.Error.Forbidden{} = error
+    end
+
+    test "after_transaction hook is called on forbidden error with :stream strategy" do
+      # Create a record without authorization
+      post =
+        PolicyPost
+        |> Ash.Changeset.for_create(:create, %{title: "forbidden_stream_test"})
+        |> Ash.create!(authorize?: false)
+
+      # Try to update with authorization - should be forbidden
+      result =
+        PolicyPost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(:update_with_after_transaction, %{title: "updated"},
+          strategy: :stream,
+          authorize?: true,
+          actor: %{allow: false},
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the forbidden error
+      assert_receive {:after_transaction_update_error, error}, 1000
+      assert %Ash.Error.Forbidden{} = error
+    end
+  end
+
+  describe "atomic validation errors during transaction" do
+    test "after_transaction hook is called when atomic validation fails in transaction with :atomic strategy" do
+      # Create a post with a normal title
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "original"})
+        |> Ash.create!()
+
+      # Try to update to a title that will trigger the atomic validation failure
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(:update_with_atomic_validation_in_transaction, %{title: "fail_in_tx"},
+          strategy: :atomic,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the error
+      assert_receive {:after_transaction_update_error, _error}, 1000
+
+      # Verify the post was NOT updated (transaction rolled back)
+      assert Ash.get!(Post, post.id).title == "original"
+    end
+
+    test "after_transaction hook is called when atomic validation fails in transaction with :atomic_batches strategy" do
+      # Create posts with normal titles
+      posts =
+        for _i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "original"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Try to update to a title that will trigger the atomic validation failure
+      result =
+        posts
+        |> Ash.bulk_update(:update_with_atomic_validation_in_transaction, %{title: "fail_in_tx"},
+          strategy: :atomic_batches,
+          batch_size: 2,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the error
+      assert_receive {:after_transaction_update_error, _error}, 1000
+
+      # Verify posts were NOT updated
+      remaining = Post |> Ash.Query.filter(id in ^post_ids) |> Ash.read!()
+      assert Enum.all?(remaining, &(&1.title == "original"))
+    end
+
+    test "after_transaction hook is called when atomic validation fails in transaction with :stream strategy" do
+      # Create a post with a normal title
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "original"})
+        |> Ash.create!()
+
+      # Try to update to a title that will trigger the atomic validation failure
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update(:update_with_atomic_validation_in_transaction, %{title: "fail_in_tx"},
+          strategy: :stream,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the error
+      assert_receive {:after_transaction_update_error, _error}, 1000
+
+      # Verify the post was NOT updated (transaction rolled back)
+      assert Ash.get!(Post, post.id).title == "original"
+    end
+
+    test "atomic validation passes when condition is not met" do
+      # Create a post with a normal title
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "original"})
+        |> Ash.create!()
+
+      # Update to a title that will NOT trigger the atomic validation failure
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_update!(:update_with_atomic_validation_in_transaction, %{title: "new_title"},
+          strategy: :atomic,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+
+      # Verify after_transaction hook was called with success
+      assert_receive {:after_transaction_update_success, _id}, 1000
+
+      # Verify the post was updated
+      assert Ash.get!(Post, post.id).title == "new_title"
     end
   end
 end

@@ -223,6 +223,39 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
     end
   end
 
+  defmodule AtomicValidationFailsInTransaction do
+    @moduledoc """
+    Validation that fails when title == "fail_in_tx".
+    For atomic strategies, uses the atomic/3 callback to check condition DURING transaction.
+    For stream strategy, uses validate/3 callback to check condition.
+    """
+    use Ash.Resource.Validation
+
+    @impl true
+    def validate(changeset, _opts, _context) do
+      # For stream strategy - check the condition on the changeset data
+      title = changeset.data && Map.get(changeset.data, :title)
+
+      if title == "fail_in_tx" do
+        {:error, field: :title, message: "atomic validation failed in transaction"}
+      else
+        :ok
+      end
+    end
+
+    @impl true
+    def atomic(_changeset, _opts, _context) do
+      # Condition checked DURING transaction - fails when title == "fail_in_tx"
+      {:atomic, [:title], expr(title == "fail_in_tx"),
+       expr(
+         error(Ash.Error.Changes.InvalidAttribute, %{
+           field: :title,
+           message: "atomic validation failed in transaction"
+         })
+       )}
+    end
+  end
+
   defmodule AfterTransactionRaisesException do
     @moduledoc """
     Change module where after_transaction hook raises an exception.
@@ -263,6 +296,25 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
 
         _changeset, {:error, error} ->
           {:error, error}
+      end)
+    end
+
+    def atomic(changeset, opts, context) do
+      {:ok, change(changeset, opts, context)}
+    end
+  end
+
+  defmodule SoftDestroyWithAfterTransaction do
+    @moduledoc """
+    Change module that adds after_transaction hooks for soft destroy actions.
+    Verifies the record was updated (not deleted) by checking attributes.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn _changeset, {:ok, result} ->
+        send(self(), {:after_transaction_soft_destroy_called, result.id, result.title2})
+        {:ok, result}
       end)
     end
 
@@ -391,6 +443,24 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
 
       destroy :destroy_with_stop_on_error_hook do
         change AfterTransactionWithStopOnError
+      end
+
+      destroy :soft do
+        soft? true
+        require_atomic? false
+        change set_attribute(:title2, "archived")
+      end
+
+      destroy :soft_with_after_transaction do
+        soft? true
+        require_atomic? false
+        change set_attribute(:title2, "soft_deleted")
+        change SoftDestroyWithAfterTransaction
+      end
+
+      destroy :destroy_with_atomic_validation_in_transaction do
+        validate AtomicValidationFailsInTransaction
+        change AtomicDestroyWithAfterTransactionHandlingErrors
       end
     end
 
@@ -555,6 +625,57 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
       uuid_primary_key :id
       attribute :title, :string, allow_nil?: false, public?: true
       attribute :title2, :string, public?: true
+    end
+  end
+
+  defmodule PolicyPost do
+    @moduledoc """
+    Resource with policies for testing forbidden error scenarios.
+    Reading is allowed for everyone, but destroying is forbidden unless actor has allow: true.
+    This allows stream strategy to query records but fail on destroy.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Ets,
+      authorizers: [Ash.Policy.Authorizer]
+
+    ets do
+      private? true
+    end
+
+    policies do
+      # Allow reading for everyone (so stream can query records)
+      policy action_type(:read) do
+        authorize_if always()
+      end
+
+      # Allow creating without actor for test setup
+      policy action_type(:create) do
+        authorize_if always()
+      end
+
+      # Forbid destroy unless actor has allow: true
+      policy action_type(:destroy) do
+        forbid_unless actor_attribute_equals(:allow, true)
+      end
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, create: :*, update: :*]
+
+      destroy :destroy do
+        primary? true
+      end
+
+      destroy :destroy_with_after_transaction do
+        change AtomicDestroyWithAfterTransactionHandlingErrors
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string, allow_nil?: false, public?: true
     end
   end
 
@@ -2301,6 +2422,119 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
     end
   end
 
+  describe "soft destroy" do
+    test "after_transaction hooks execute on soft destroy" do
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "soft_test_1"})
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "soft_test_2"})
+        |> Ash.create!()
+
+      result =
+        [post1, post2]
+        |> Ash.bulk_destroy!(:soft_with_after_transaction, %{},
+          resource: Post,
+          strategy: [:stream],
+          return_records?: true,
+          return_errors?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 2
+
+      # Verify hooks were called for both records
+      assert_receive {:after_transaction_soft_destroy_called, _, "soft_deleted"}, 1000
+      assert_receive {:after_transaction_soft_destroy_called, _, "soft_deleted"}, 1000
+
+      # Verify records still exist (not deleted) with updated title2
+      remaining = Ash.read!(Post)
+      assert length(remaining) == 2
+      assert Enum.all?(remaining, &(&1.title2 == "soft_deleted"))
+    end
+
+    test "after_transaction hooks receive updated record with soft destroy attribute" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "soft_attr_test", title2: "original"})
+        |> Ash.create!()
+
+      result =
+        [post]
+        |> Ash.bulk_destroy!(:soft_with_after_transaction, %{},
+          resource: Post,
+          strategy: [:stream],
+          return_records?: true
+        )
+
+      assert result.status == :success
+
+      # Hook receives the record with title2 already changed
+      assert_receive {:after_transaction_soft_destroy_called, id, "soft_deleted"}, 1000
+      assert id == post.id
+
+      # Verify the record in database has the soft delete attribute
+      [updated_post] = Ash.read!(Post)
+      assert updated_post.title2 == "soft_deleted"
+      assert updated_post.title == "soft_attr_test"
+    end
+
+    test "soft destroy with return_records? returns updated records" do
+      post1 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "return_test_1"})
+        |> Ash.create!()
+
+      post2 =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "return_test_2"})
+        |> Ash.create!()
+
+      result =
+        [post1, post2]
+        |> Ash.bulk_destroy!(:soft_with_after_transaction, %{},
+          resource: Post,
+          strategy: [:stream],
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 2
+
+      # Returned records should have the soft delete attribute set
+      assert Enum.all?(result.records, &(&1.title2 == "soft_deleted"))
+
+      # Original titles should be preserved
+      titles = Enum.map(result.records, & &1.title) |> Enum.sort()
+      assert titles == ["return_test_1", "return_test_2"]
+    end
+
+    test "soft destroy without after_transaction hook works" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "basic_soft_test"})
+        |> Ash.create!()
+
+      result =
+        [post]
+        |> Ash.bulk_destroy!(:soft, %{},
+          resource: Post,
+          strategy: [:stream],
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert [%{title2: "archived"}] = result.records
+
+      # Record still exists
+      [remaining] = Ash.read!(Post)
+      assert remaining.title2 == "archived"
+    end
+  end
+
   describe "manual actions" do
     test "after_transaction hooks work with manual destroy action (single record)" do
       post =
@@ -2443,6 +2677,193 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
       # Verify hooks executed
       assert_receive {:manual_destroy_after_transaction_success, _id1}, 1000
       assert_receive {:manual_destroy_after_transaction_success, _id2}, 1000
+    end
+  end
+
+  describe "forbidden errors" do
+    test "after_transaction hook is called on forbidden error with :atomic strategy" do
+      # Create a record without authorization
+      post =
+        PolicyPost
+        |> Ash.Changeset.for_create(:create, %{title: "forbidden_test"})
+        |> Ash.create!(authorize?: false)
+
+      # Try to destroy with authorization - should be forbidden
+      result =
+        PolicyPost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(:destroy_with_after_transaction, %{},
+          strategy: :atomic,
+          authorize?: true,
+          actor: %{allow: false},
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the forbidden error
+      assert_receive {:after_transaction_destroy_error, error}, 1000
+      assert %Ash.Error.Forbidden{} = error
+    end
+
+    test "after_transaction hook is called on forbidden error with :atomic_batches strategy" do
+      # Create records without authorization
+      posts =
+        for i <- 1..3 do
+          PolicyPost
+          |> Ash.Changeset.for_create(:create, %{title: "forbidden_batch_#{i}"})
+          |> Ash.create!(authorize?: false)
+        end
+
+      # Try to destroy with authorization - should be forbidden
+      result =
+        posts
+        |> Ash.bulk_destroy(:destroy_with_after_transaction, %{},
+          strategy: :atomic_batches,
+          batch_size: 2,
+          authorize?: true,
+          actor: %{allow: false},
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the forbidden error
+      assert_receive {:after_transaction_destroy_error, error}, 1000
+      assert %Ash.Error.Forbidden{} = error
+    end
+
+    test "after_transaction hook is called on forbidden error with :stream strategy" do
+      # Create a record without authorization
+      post =
+        PolicyPost
+        |> Ash.Changeset.for_create(:create, %{title: "forbidden_stream_test"})
+        |> Ash.create!(authorize?: false)
+
+      # Try to destroy with authorization - should be forbidden
+      result =
+        PolicyPost
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(:destroy_with_after_transaction, %{},
+          strategy: :stream,
+          authorize?: true,
+          actor: %{allow: false},
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the forbidden error
+      assert_receive {:after_transaction_destroy_error, error}, 1000
+      assert %Ash.Error.Forbidden{} = error
+    end
+  end
+
+  describe "atomic validation errors during transaction" do
+    test "after_transaction hook is called when atomic validation fails in transaction with :atomic strategy" do
+      # Create a post with a title that will trigger the atomic validation failure
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "fail_in_tx"})
+        |> Ash.create!()
+
+      # Try to destroy - the atomic validation will fail during the transaction
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(:destroy_with_atomic_validation_in_transaction, %{},
+          strategy: :atomic,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the error
+      assert_receive {:after_transaction_destroy_error, _error}, 1000
+
+      # Verify the post was NOT destroyed (transaction rolled back)
+      assert Ash.get!(Post, post.id)
+    end
+
+    test "after_transaction hook is called when atomic validation fails in transaction with :atomic_batches strategy" do
+      # Create posts with titles that will trigger the atomic validation failure
+      posts =
+        for i <- 1..3 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{title: "fail_in_tx"})
+          |> Ash.create!()
+        end
+
+      post_ids = Enum.map(posts, & &1.id)
+
+      # Try to destroy - the atomic validation will fail during the transaction
+      result =
+        posts
+        |> Ash.bulk_destroy(:destroy_with_atomic_validation_in_transaction, %{},
+          strategy: :atomic_batches,
+          batch_size: 2,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the error
+      assert_receive {:after_transaction_destroy_error, _error}, 1000
+
+      # Verify posts were NOT destroyed
+      remaining = Post |> Ash.Query.filter(id in ^post_ids) |> Ash.read!()
+      assert length(remaining) == 3
+    end
+
+    test "after_transaction hook is called when atomic validation fails in transaction with :stream strategy" do
+      # Create a post with a title that will trigger the atomic validation failure
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "fail_in_tx"})
+        |> Ash.create!()
+
+      # Try to destroy - the atomic validation will fail during the transaction
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy(:destroy_with_atomic_validation_in_transaction, %{},
+          strategy: :stream,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+
+      # Verify after_transaction hook was called with the error
+      assert_receive {:after_transaction_destroy_error, _error}, 1000
+
+      # Verify the post was NOT destroyed (transaction rolled back)
+      assert Ash.get!(Post, post.id)
+    end
+
+    test "atomic validation passes when condition is not met" do
+      # Create a post with a title that will NOT trigger the atomic validation failure
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "normal_title"})
+        |> Ash.create!()
+
+      # Destroy should succeed because the title doesn't match the validation condition
+      result =
+        Post
+        |> Ash.Query.filter(id == ^post.id)
+        |> Ash.bulk_destroy!(:destroy_with_atomic_validation_in_transaction, %{},
+          strategy: :atomic,
+          return_records?: true
+        )
+
+      assert result.status == :success
+      assert length(result.records) == 1
+
+      # Verify after_transaction hook was called with success
+      assert_receive {:after_transaction_destroy_success, _id}, 1000
+
+      # Verify the post was destroyed
+      assert [] = Ash.read!(Post)
     end
   end
 end

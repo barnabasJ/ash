@@ -2788,7 +2788,7 @@ defmodule Ash.Test.Actions.BulkDestroyAfterTransactionTest do
     test "after_transaction hook is called when atomic validation fails in transaction with :atomic_batches strategy" do
       # Create posts with titles that will trigger the atomic validation failure
       posts =
-        for i <- 1..3 do
+        for _i <- 1..3 do
           Post
           |> Ash.Changeset.for_create(:create, %{title: "fail_in_tx"})
           |> Ash.create!()

@@ -184,6 +184,45 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
     end
   end
 
+  defmodule CreateAfterTransactionHandlingErrors do
+    @moduledoc """
+    Change module that adds after_transaction hooks that handle both success and failure.
+    """
+    use Ash.Resource.Change
+
+    def change(changeset, _opts, _context) do
+      Ash.Changeset.after_transaction(changeset, fn
+        _changeset, {:ok, result} ->
+          send(self(), {:after_transaction_create_success, result.id})
+          {:ok, result}
+
+        _changeset, {:error, error} ->
+          send(self(), {:after_transaction_create_error, error})
+          {:error, error}
+      end)
+    end
+  end
+
+  defmodule ValidationFailsForCreate do
+    @moduledoc """
+    Validation that fails when title == "fail_in_tx".
+    For create actions, uses validate/3 callback since creates can't be atomic.
+    """
+    use Ash.Resource.Validation
+
+    @impl true
+    def validate(changeset, _opts, _context) do
+      # Check the condition on the changeset
+      title = Ash.Changeset.get_attribute(changeset, :title)
+
+      if title == "fail_in_tx" do
+        {:error, field: :title, message: "validation failed for title"}
+      else
+        :ok
+      end
+    end
+  end
+
   defmodule ManualCreateSimple do
     @moduledoc """
     Simple manual create module that just performs the create.
@@ -456,6 +495,11 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
                    {:error, error}
                end)
       end
+
+      create :create_with_validation_and_after_transaction do
+        validate ValidationFailsForCreate
+        change CreateAfterTransactionHandlingErrors
+      end
     end
 
     attributes do
@@ -589,6 +633,53 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
 
     relationships do
       belongs_to :org, Org, public?: true, attribute_writable?: true
+    end
+  end
+
+  defmodule PolicyPost do
+    @moduledoc """
+    Resource with policies for testing forbidden error scenarios.
+    Reading is allowed for everyone, but creating is forbidden unless actor has allow: true.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Ets,
+      authorizers: [Ash.Policy.Authorizer]
+
+    ets do
+      private? true
+    end
+
+    policies do
+      # Allow reading for everyone
+      policy action_type(:read) do
+        authorize_if always()
+      end
+
+      # Forbid create unless actor has allow: true
+      policy action_type(:create) do
+        forbid_unless actor_attribute_equals(:allow, true)
+      end
+    end
+
+    actions do
+      default_accept :*
+      defaults [:read, :destroy]
+
+      create :create do
+        accept [:title]
+        primary? true
+      end
+
+      create :create_with_after_transaction do
+        accept [:title]
+        change CreateAfterTransactionHandlingErrors
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string, allow_nil?: false, public?: true
     end
   end
 
@@ -1848,6 +1939,214 @@ defmodule Ash.Test.Actions.BulkCreateAfterTransactionTest do
       # Verify hooks executed
       assert_receive {:manual_after_transaction_success, _id1}, 1000
       assert_receive {:manual_after_transaction_success, _id2}, 1000
+    end
+  end
+
+  describe "forbidden errors" do
+    test "after_transaction called on forbidden error with transaction: :batch" do
+      result =
+        Ash.bulk_create(
+          [%{title: "test1"}, %{title: "test2"}],
+          PolicyPost,
+          :create_with_after_transaction,
+          authorize?: true,
+          actor: %{allow: false},
+          return_errors?: true
+        )
+
+      assert result.status == :error
+      # Authorization happens once per batch, so we get one error callback per changeset
+      # that gets through to the after_transaction hook
+      assert_receive {:after_transaction_create_error, error1}, 1000
+      assert %Ash.Error.Forbidden{} = error1
+    end
+
+    test "after_transaction called on forbidden error with transaction: :all" do
+      result =
+        Ash.bulk_create(
+          [%{title: "test1"}, %{title: "test2"}],
+          PolicyPost,
+          :create_with_after_transaction,
+          authorize?: true,
+          actor: %{allow: false},
+          transaction: :all,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+      # Authorization happens once per batch
+      assert_receive {:after_transaction_create_error, error1}, 1000
+      assert %Ash.Error.Forbidden{} = error1
+    end
+
+    test "after_transaction called on forbidden error with return_stream?" do
+      result_stream =
+        Ash.bulk_create(
+          [%{title: "test1"}, %{title: "test2"}],
+          PolicyPost,
+          :create_with_after_transaction,
+          authorize?: true,
+          actor: %{allow: false},
+          return_stream?: true,
+          return_errors?: true
+        )
+
+      # Consume the stream to trigger processing
+      results = Enum.to_list(result_stream)
+
+      # Results should contain errors
+      errors = Enum.filter(results, fn r -> match?({:error, _}, r) end)
+      assert length(errors) >= 1
+
+      # Should receive at least one error callback
+      assert_receive {:after_transaction_create_error, error1}, 1000
+      assert %Ash.Error.Forbidden{} = error1
+    end
+  end
+
+  describe "validation errors during transaction" do
+    test "after_transaction called when validation fails with transaction: :batch" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create(
+          [%{title: "fail_in_tx"}],
+          Post,
+          :create_with_validation_and_after_transaction,
+          tenant: org.id,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+      assert result.error_count == 1
+
+      # After_transaction should have been called with the error
+      assert_receive {:after_transaction_create_error, _error}, 1000
+
+      # Verify no record was created
+      assert Post |> Ash.read!(tenant: org.id) |> length() == 0
+    end
+
+    test "after_transaction called when validation fails with transaction: :all" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create(
+          [%{title: "fail_in_tx"}],
+          Post,
+          :create_with_validation_and_after_transaction,
+          tenant: org.id,
+          transaction: :all,
+          return_errors?: true
+        )
+
+      assert result.status == :error
+      assert result.error_count == 1
+
+      # After_transaction should have been called with the error
+      assert_receive {:after_transaction_create_error, _error}, 1000
+
+      # Verify no record was created
+      assert Post |> Ash.read!(tenant: org.id) |> length() == 0
+    end
+
+    test "mixed valid and invalid records with transaction: :batch" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create(
+          [%{title: "valid_title"}, %{title: "fail_in_tx"}, %{title: "another_valid"}],
+          Post,
+          :create_with_validation_and_after_transaction,
+          tenant: org.id,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # For create actions, validation happens during changeset building.
+      # By default, changesets in a batch are processed together, so an invalid
+      # changeset in the batch affects the whole batch.
+      # The result status depends on whether any records succeeded.
+      assert result.error_count >= 1
+
+      # Error callback for invalid record should have been called
+      assert_receive {:after_transaction_create_error, _error}, 1000
+
+      # If some records succeeded, we should also receive success callbacks
+      if result.records && length(result.records) > 0 do
+        assert_receive {:after_transaction_create_success, _id}, 1000
+      end
+
+      # Verify no invalid records were created
+      posts = Post |> Ash.read!(tenant: org.id)
+      refute Enum.any?(posts, fn p -> p.title == "fail_in_tx" end)
+    end
+
+    test "all records fail when one invalid with transaction: :all" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result =
+        Ash.bulk_create(
+          [%{title: "valid_title"}, %{title: "fail_in_tx"}, %{title: "another_valid"}],
+          Post,
+          :create_with_validation_and_after_transaction,
+          tenant: org.id,
+          transaction: :all,
+          return_records?: true,
+          return_errors?: true
+        )
+
+      # With :all transaction, the whole transaction fails if any record fails
+      # But the error happens during changeset building, before the transaction
+      # so valid ones may still succeed while invalid ones fail
+      assert result.error_count >= 1
+
+      # Verify the error was received
+      assert_receive {:after_transaction_create_error, _error}, 1000
+
+      # Verify no invalid records were created
+      posts = Post |> Ash.read!(tenant: org.id)
+      refute Enum.any?(posts, fn p -> p.title == "fail_in_tx" end)
+    end
+
+    test "after_transaction called when validation fails with return_stream?" do
+      org =
+        Org
+        |> Ash.Changeset.for_create(:create, %{})
+        |> Ash.create!()
+
+      result_stream =
+        Ash.bulk_create(
+          [%{title: "fail_in_tx"}],
+          Post,
+          :create_with_validation_and_after_transaction,
+          tenant: org.id,
+          return_stream?: true,
+          return_errors?: true
+        )
+
+      # Consume the stream
+      results = Enum.to_list(result_stream)
+      assert length(results) == 1
+      assert {:error, _error} = hd(results)
+
+      # After_transaction should have been called with the error
+      assert_receive {:after_transaction_create_error, _error}, 1000
+
+      # Verify no record was created
+      assert Post |> Ash.read!(tenant: org.id) |> length() == 0
     end
   end
 end

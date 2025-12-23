@@ -957,15 +957,31 @@ defmodule Ash.Actions.Update.Bulk do
     # Run after_transaction for each record
     {processed_records, hook_errors} =
       if Enum.empty?(atomic_changeset.after_transaction) do
-        {bulk_result.records, []}
+        {bulk_result.records || [], []}
       else
-        Enum.reduce(bulk_result.records, {[], []}, fn result, {records, errors} ->
-          case Ash.Changeset.run_after_transactions({:ok, result}, atomic_changeset) do
-            {:ok, result} -> {[result | records], errors}
-            {:error, error} -> {records, [error | errors]}
+        # Only process records if we have them (not nil/empty from error status)
+        if bulk_result.status == :error || is_nil(bulk_result.records) do
+          # Run after_transaction hooks with the error for error results
+          case Ash.Changeset.run_after_transactions(
+                 {:error,
+                  Ash.Error.to_ash_error(bulk_result.errors |> List.first() || "Unknown error")},
+                 atomic_changeset
+               ) do
+            {:ok, result} ->
+              {[result], []}
+
+            {:error, error} ->
+              {[], [error]}
           end
-        end)
-        |> then(fn {records, errors} -> {Enum.reverse(records), Enum.reverse(errors)} end)
+        else
+          Enum.reduce(bulk_result.records, {[], []}, fn result, {records, errors} ->
+            case Ash.Changeset.run_after_transactions({:ok, result}, atomic_changeset) do
+              {:ok, result} -> {[result | records], errors}
+              {:error, error} -> {records, [error | errors]}
+            end
+          end)
+          |> then(fn {records, errors} -> {Enum.reverse(records), Enum.reverse(errors)} end)
+        end
       end
 
     # Load data AFTER hooks (so loaded data reflects hook modifications)
